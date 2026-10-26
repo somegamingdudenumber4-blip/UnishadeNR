@@ -1,0 +1,5 @@
+PASS identity retains 4K checker at 50% model scale: max_error=0.00000000
+PASS neural edit retains 4K checker: max_error=0.00000006
+PASS raw output compatibility: max_error=0.00000000
+PASS linear-light detail transfer: max_error=0.00000006
+PASS debug view compatibility: max_error=0.00000000

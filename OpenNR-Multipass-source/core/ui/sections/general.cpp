@@ -1,0 +1,172 @@
+#include "sections.h"
+
+#include "../i18n.h"
+#include "../theme.h"
+#include "../view_logic.h"
+#include "../widgets/widgets.h"
+
+namespace ui {
+
+namespace {
+
+void Switches(PanelSettings &s, const PanelStatus &status)
+{
+    bool on = s.enabled != 0;
+    if (ImGui::Checkbox(T("Enabled", "Ligado"), &on))
+        s.enabled = on ? 1u : 0u;
+    ImGui::SameLine();
+    StatusLine(status, s);
+
+    bool start = s.startOn != 0;
+    if (ImGui::Checkbox(T("On at startup", "Ligar ao abrir o jogo"), &start))
+        s.startOn = start ? 1u : 0u;
+    Help("Whether Enabled is already ticked when the game opens, instead of waiting for the "
+         "hotkey every time.",
+         "Se o Ligado já vem marcado quando o jogo abre, em vez de esperar a tecla de atalho "
+         "toda vez.");
+
+    bool altTab = s.disableOnAltTab != 0;
+    if (ImGui::Checkbox(T("Off on alt-tab", "Desligar no alt-tab"), &altTab))
+        s.disableOnAltTab = altTab ? 1u : 0u;
+    Help("Switches the effect off when the game stops being the window in front, and leaves it "
+         "off -- turn it back on with the hotkey. A minimised window is always sat out, "
+         "separately, and that one does resume on its own.",
+
+         "Desliga o efeito quando o jogo deixa de ser a janela da frente, e deixa desligado -- "
+         "religue na tecla de atalho. Janela minimizada é outra coisa: sempre pulada, e essa "
+         "volta sozinha.");
+}
+
+// The status column. It used to be a collapsing section of its own, which spent a header and a
+// click on five lines of text that never need either -- and which, being at the bottom, reported
+// the skip rate somewhere you would only look after you already suspected it.
+//
+// Now it runs down the right edge, opposite the switches, in vertical space those rows already
+// occupy. Reading order is the point: the left column is what you change, the right column is what
+// happened, and the two are side by side.
+void StatusColumn(const PanelStatus &status)
+{
+    const bool skipping = Skipping(status);
+    RightLine(skipping ? &kWarn : nullptr, "%s", status.routeNote.c_str());
+    if (status.outWidth != 0)
+        RightLine(nullptr, T("%ux%u to %ux%u", "%ux%u para %ux%u"), status.outWidth,
+                  status.outHeight, status.netWidth, status.netHeight);
+    // What used to be an eleven-control Guides tab. Every one of those switches is on by default
+    // and picks itself: depth and motion are taken when the game hands them over and estimated
+    // when it does not, the companion effect is used when it is installed. The switches are still
+    // there, one cascade entry away, for a target where the detector picks the wrong buffer; this
+    // line is what a person actually needs, which is what the network is being fed.
+    RightLine(nullptr, T("depth %s, motion %s", "profundidade %s, movimento %s"),
+              GuideSourceName(status.depthSource), GuideSourceName(status.motionSource));
+    if (status.stillPct >= 0)
+        RightLine(nullptr, T("depth %.4f..%.4f, %d%% still", "profundidade %.4f..%.4f, %d%% parado"),
+                  static_cast<double>(status.depthMin), static_cast<double>(status.depthMax),
+                  status.stillPct);
+    if (status.danielblnc != nullptr && status.danielblncMs > 0.0f)
+        RightLine(nullptr, T("danielblnc %s: network %.1f ms", "danielblnc %s: rede %.1f ms"),
+                  status.danielblnc, static_cast<double>(status.danielblncMs));
+    else if (status.danielblnc != nullptr)
+        RightLine(nullptr, "danielblnc %s", status.danielblnc);
+    if (status.mochizuki == 1)
+        RightLine(nullptr, "%s",
+                  T("mochizuki: building the network", "mochizuki: construindo a rede"));
+    else if (status.mochizuki == 2)
+        RightLine(nullptr, T("mochizuki: network %.1f ms", "mochizuki: rede %.1f ms"),
+                  static_cast<double>(status.mochizukiMs));
+    else if (status.mochizuki == 3)
+        RightLine(&kWarn, "%s", T("mochizuki failed; see mochizuki_nr.log",
+                                  "mochizuki falhou; veja mochizuki_nr.log"));
+    else if (status.mochizuki == 4)
+        RightLine(&kWarn, T("mochizuki: network refused -- %s", "mochizuki: rede recusada -- %s"),
+                  status.mochizukiNote.empty() ? T("see mochizuki_nr.log", "veja mochizuki_nr.log")
+                                               : status.mochizukiNote.c_str());
+    if (status.mochizuki != 4 && !status.mochizukiNote.empty())
+        Note(kWarn, (std::string(T("mochizuki: ", "mochizuki: ")) + status.mochizukiNote +
+                     T(", the last it ran at.", ", os últimos com que ela rodou.")).c_str());
+    if (skipping)
+        Note(kWarn, T("The network is not finishing inside a frame, and that is the flicker. "
+                      "Lower Scale and set Passes to 1.",
+                      "A rede não está terminando dentro do quadro, e é isso o piscar. Baixe a "
+                      "Escala e ponha Passes em 1."));
+}
+
+// mochizuki's network, when its folder has a choice: the model, and int4 mixed, which is made from the
+// 310.8 model and so takes it along. Either rebuilds the network.
+void MochizukiModel(PanelSettings &s, const PanelStatus &status)
+{
+    const bool int4 = (status.mochizukiModels & 2u) != 0 && s.mzInt4 != 0;
+    if ((status.mochizukiModels & 1u) != 0)
+    {
+        ImGui::BeginDisabled(int4);
+        bool old = s.mzOriginalModel != 0 || int4;
+        if (ImGui::Checkbox(T("Old model", "Modelo antigo"), &old))
+            s.mzOriginalModel = old ? 1u : 0u;
+        ImGui::EndDisabled();
+        Help("NVIDIA's 310.8 model instead of 310.9's, which is the default: 310.9 is about a third faster and "
+             "answers a little differently. int4 mixed ticks this, since it is made from 310.8. A change rebuilds "
+             "the network.",
+             "O modelo 310.8 da NVIDIA em vez do 310.9, que é o padrão: o 310.9 é cerca de um terço mais rápido e "
+             "responde um pouco diferente. O int4 misto marca isto, porque é feito do 310.8. Mudar reconstrói a "
+             "rede.");
+    }
+    if ((status.mochizukiModels & 2u) == 0)
+        return;
+    bool mixed = s.mzInt4 != 0;
+    if (ImGui::Checkbox(T("int4 mixed", "int4 misto"), &mixed))
+        s.mzInt4 = mixed ? 1u : 0u;
+    Help("Part of the 310.8 network in 4-bit weights: faster, the picture slightly different. It needs ACO "
+         "(dlssnr-amd\\aco\\ and a driver with pipeline binaries); without it the default network runs and "
+         "mochizuki_nr.log says why. A change rebuilds the network.",
+         "Parte da rede 310.8 com pesos de 4 bits: mais rápida, a imagem um pouco diferente. Precisa do ACO "
+         "(dlssnr-amd\\aco\\ e um driver com pipeline binaries); sem ele roda a rede padrão e o "
+         "mochizuki_nr.log diz por quê. Mudar reconstrói a rede.");
+}
+
+// The runtime is taken when the network first starts, so a pick here is written to amd-nr.ini and
+// applies on the next launch.
+void Runtime(PanelSettings &s, const PanelStatus &status, PanelActions &actions)
+{
+    int chosen = status.runtimeChosen;
+    if (ImGui::Combo(T("NR runtime", "Runtime da rede"), &chosen,
+                     "danielblnc (HIP)\0mochizuki (Vulkan)\0") &&
+        chosen != status.runtimeChosen)
+        actions.runtime = chosen;
+    Help("Which port of NVIDIA's network runs it. danielblnc runs it in HIP kernels, on RDNA3 and "
+         "RDNA4. mochizuki runs it as Vulkan shaders with FP8 matrix instructions, on RDNA4 (RX "
+         "9000) only, and builds the network the first time in each game, which takes up to a "
+         "minute. Each needs its own files in the game's folder. Applies when the game is started "
+         "again.",
+         "Qual porte da rede da NVIDIA roda. O danielblnc roda em kernels HIP, em RDNA3 e RDNA4. O "
+         "mochizuki roda como shaders Vulkan com instruções de matriz FP8, só em RDNA4 (RX 9000), e "
+         "constrói a rede na primeira vez em cada jogo, o que leva até um minuto. Cada um precisa "
+         "dos próprios arquivos na pasta do jogo. Vale quando o jogo for aberto de novo.");
+    if (status.mochizukiCrashed && chosen == 0)
+        Note(kWarn, T("mochizuki's last start here went down while it built the network (the game crashed or was "
+                      "closed), so this one runs danielblnc. Pick mochizuki again to retry; its log will then name "
+                      "every shader it compiles.",
+                      "A última abertura com o mochizuki aqui caiu enquanto ele montava a rede (o jogo travou ou "
+                      "foi fechado), então esta roda o danielblnc. Escolha o mochizuki de novo para tentar outra "
+                      "vez; o log dele vai mostrar cada shader que compilar."));
+    else if (chosen >= 0 && chosen < 2 && !status.runtimeInstalled[chosen])
+        Note(kWarn, T("Not installed in this game's folder.", "Não está instalado na pasta deste jogo."));
+    else if (status.runtimeActive >= 0 && chosen != status.runtimeActive)
+        Note(kWarn, T("Restart the game to switch.", "Reinicie o jogo para trocar."));
+    if (status.mochizuki != 0)
+        MochizukiModel(s, status);
+}
+
+} // namespace
+
+void DrawGeneral(PanelSettings &s, const PanelStatus &status, PanelActions &actions)
+{
+    Switches(s, status);
+    if (HotkeyButton(status))
+        actions.Add(PanelAction::ToggleHotkeyCapture);
+    int lang = s.language;
+    if (ImGui::Combo(T("Language", "Idioma"), &lang, "English\0Português\0"))
+        s.language = lang;
+    StatusColumn(status);
+    Runtime(s, status, actions);
+}
+
+} // namespace ui

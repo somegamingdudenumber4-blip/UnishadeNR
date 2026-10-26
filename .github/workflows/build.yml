@@ -1,0 +1,21 @@
+name: Windows source build
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build host and native add-ons
+        shell: powershell
+        run: ./scripts/build.ps1
+      - name: Upload compiled source artifacts (no runtime or model)
+        uses: actions/upload-artifact@v4
+        with:
+          name: UnishadeNR-source-build
+          path: |
+            build/Release/UnishadeNR.exe
+            build/Release/UnishadeUi.dll
+            OpenNR-Multipass-source/build-nr/amd-nr.addon64
+            OpenNR-Multipass-source/build-nr/amd-nr-panelinput.addon64

@@ -1,0 +1,484 @@
+// The mochizuki runtime: MochizukiNrRuntime.dll, mochizuki0323's Vulkan port of the network behind
+// the C ABI the OptiScaler fork drives it with (3rdparty/mochizuki). NrBackend=mochizuki in
+// amd-nr.ini picks it over dlssnr_amd_pass1.dll, read once, so a change needs a restart.
+//
+// It runs on a Vulkan device of its own on the same GPU and reaches our D3D12 device through
+// shared buffers and a shared fence. The list is cut in two around it: the inputs are copied out,
+// the first half is submitted, the runtime queues the network between the halves on our queue,
+// and the second half copies the answer back into netColour. The network runs inside the
+// runtime's RenoDX stage, which composes the picture itself, so netColour comes back finished:
+// RecordNetwork's compose only puts it on the frame, with nothing of its own, and Intensity, Colour
+// and the model's controls go to the stage. Passes and temporal history live inside the runtime,
+// so none of the per-module copies apply.
+//
+// Included inside neural.cpp's anonymous namespace, after TuningFor.
+
+#include "../../3rdparty/mochizuki/LmxxfNrApi.h"
+#include "../../3rdparty/mochizuki/MochizukiNrControls.h"
+#include "../shared/runtime_choice.h"
+
+struct Mochizuki {
+    int selected = -1; // -1 until amd-nr.ini is read; then the runtime this run uses
+    int chosen = 0;    // what amd-nr.ini asks for now, for the next launch
+    bool installed[runtime_choice::kCount]{};
+    HMODULE dll = nullptr;
+    LmxxfNrApi api{};
+    PFN_MochizukiNrSetControls setControls = nullptr;
+    PFN_MochizukiNrGetInfo getInfo = nullptr;
+    MochizukiNrControls defaults{}, sent{};
+    bool sentValid = false;
+    void* session = nullptr;
+    ID3D12Device* device = nullptr; // the device the session was created on
+    void* lastJob = nullptr;
+    std::string reason, said;
+    bool crashed = false; // the last network build here never finished; this run took danielblnc
+    // The Scale and Passes the running network was built at, taken when a frame first runs on a network
+    // of a new extent (builtW/H/Passes): the old network can still run a frame after a change, and that
+    // frame says nothing about the new values. Since when PrepareFrame has refused with no build under
+    // way (0 while it runs or builds), and why; and what the panel says after a revert.
+    float goodScale = 0.0f;
+    int goodPasses = 0;
+    uint32_t builtW = 0, builtH = 0, builtPasses = 0;
+    ULONGLONG refusedSince = 0;
+    std::string refusal, reverted;
+    uint32_t models = 0; // PanelStatus::mochizukiModels, looked at once with the rest of the folder
+    // Encoding 0: the frame as 8-bit sRGB for the runtime (MzToSdr), and the copy shader both ways.
+    ComPtr<ID3D12Resource> sdr;
+    ComPtr<ID3D12PipelineState> convert;
+};
+// Never destroyed, like g: its session and module outlive anything that could run at exit.
+Mochizuki &mz = *new Mochizuki;
+
+bool MzSelected() {
+    if (mz.selected < 0) {
+        mz.chosen = runtime_choice::Read(ExeDirectory());
+        for (int r = 0; r < runtime_choice::kCount; ++r)
+            mz.installed[r] = runtime_choice::Installed(ExeDirectory(), r);
+        // The installer takes mochizuki's files out on a card that is not RX 9000 and leaves amd-nr.ini to the
+        // person, so an ini can still name it here: run danielblnc then, rather than nothing.
+        mz.selected =
+            mz.chosen == runtime_choice::kMochizuki && mz.installed[runtime_choice::kMochizuki] ? 1
+                                                                                                : 0;
+        std::error_code ec;
+        const auto models = ExeDirectory() / L"dlssnr-amd";
+        const auto has = [&](const wchar_t* name) {
+            return std::filesystem::exists(models / name, ec);
+        };
+        mz.models = (has(L"dlssnr.bin") && has(L"dlssnr-small.bin") ? 1u : 0u) |
+                    (has(L"dlssnr-int4.bin") && has(L"int4") ? 2u : 0u);
+        if (mz.selected == 1 && runtime_choice::MochizukiBuildDied(ExeDirectory())) {
+            mz.selected = 0;
+            mz.chosen = runtime_choice::kDanielblnc;
+            mz.crashed = true;
+            runtime_choice::Write(ExeDirectory(), mz.chosen);
+            Log("runtime: danielblnc. mochizuki's last network build in this folder never finished: the game crashed "
+                "or was closed while it compiled (mochizuki_nr.log ends on \"building the network\"). NrBackend is "
+                "danielblnc in amd-nr.ini now; pick mochizuki again to retry, and its log will name every shader it "
+                "compiles.");
+        } else if (mz.selected == 1)
+            Log("runtime: mochizuki (NrBackend=mochizuki in amd-nr.ini, or no NrBackend and mochizuki installed)");
+        else if (mz.chosen == runtime_choice::kMochizuki)
+            Log("runtime: amd-nr.ini names mochizuki, but MochizukiNrRuntime.dll or a model in dlssnr-amd\\ "
+                "is not here; running danielblnc");
+    }
+    return mz.selected == 1;
+}
+
+// The runtime's own words for what went wrong, logged when they change: a network build says
+// the same thing for every frame it takes.
+void MzSay(const char* what) {
+    char err[256]{};
+    if (mz.api.GetLastError != nullptr)
+        mz.api.GetLastError(err, sizeof err);
+    std::string line = std::string(what) + ": " + err;
+    if (line != mz.said) {
+        mz.said = line;
+        Log("mochizuki: %s", line.c_str());
+    }
+}
+
+bool MzOff(const char* what) {
+    MzSay(what);
+    mz.reason = "mochizuki runtime: " + mz.said + "; see amd-nr.log and mochizuki_nr.log";
+    g.status.reason = mz.reason.c_str();
+    return false;
+}
+
+bool MzLoad() {
+    if (mz.dll != nullptr)
+        return true;
+    const auto file = ExeDirectory() / L"MochizukiNrRuntime.dll";
+    HMODULE h = LoadLibraryExW(file.c_str(), nullptr,
+                               LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (h == nullptr) {
+        Log("mochizuki: %ls did not load (error %lu). It needs vulkan-1.dll, which the AMD driver "
+            "installs.",
+            file.c_str(), GetLastError());
+        mz.reason = "MochizukiNrRuntime.dll did not load; see amd-nr.log";
+        g.status.reason = mz.reason.c_str();
+        return false;
+    }
+    // Never unloaded: its build thread and the Vulkan driver can outlive any point we could
+    // free it at.
+    HMODULE pinned{};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       reinterpret_cast<LPCWSTR>(h), &pinned);
+    auto getApi =
+        reinterpret_cast<int32_t (*)(uint32_t, LmxxfNrApi*)>(GetProcAddress(h, "LmxxfNrGetApi"));
+    mz.api.struct_size = sizeof mz.api;
+    if (getApi == nullptr || getApi(LMXXF_NR_ABI_VERSION, &mz.api) != LMXXF_NR_OK) {
+        Log("mochizuki: %ls does not offer ABI %u", file.c_str(), LMXXF_NR_ABI_VERSION);
+        mz.reason = "MochizukiNrRuntime.dll is not a build this add-on can drive";
+        g.status.reason = mz.reason.c_str();
+        return false;
+    }
+    mz.setControls =
+        reinterpret_cast<PFN_MochizukiNrSetControls>(GetProcAddress(h, "MochizukiNrSetControls"));
+    mz.getInfo = reinterpret_cast<PFN_MochizukiNrGetInfo>(GetProcAddress(h, "MochizukiNrGetInfo"));
+    mz.defaults.struct_size = sizeof mz.defaults;
+    if (auto defaults = reinterpret_cast<PFN_MochizukiNrGetControlDefaults>(
+            GetProcAddress(h, "MochizukiNrGetControlDefaults")))
+        defaults(&mz.defaults);
+    mz.dll = h;
+    return true;
+}
+
+// A session per D3D12 device. The one on a device that went away is drained and dropped first.
+bool MzInit() {
+    if (mz.session != nullptr && mz.device == g.device.Get())
+        return true;
+    if (!MzLoad())
+        return false;
+    if (mz.session != nullptr) {
+        mz.api.Drain(mz.session);
+        mz.api.Destroy(mz.session);
+        mz.session = nullptr;
+        mz.lastJob = nullptr;
+        mz.sentValid = false;
+    }
+    const std::wstring dir = ExeDirectory().wstring();
+    // ACO's machine code where dlssnr-amd\aco\ and the driver have it, as the OptiScaler fork runs it; the
+    // runtime takes it once a process. A runtime from before ACO refuses the flag, and runs without it.
+    LmxxfNrCreateInfo ci{sizeof ci, g.device.Get(), g.queue.Get(), dir.c_str(),
+                         LMXXF_NR_CREATE_FLAG_ZERO_OUTPUT_FALLBACK |
+                             (g.settings.mzAco.load() ? LMXXF_NR_CREATE_FLAG_ACO : 0u)};
+    void* s = nullptr;
+    int32_t created = mz.api.Create(&ci, &s);
+    if (created == LMXXF_NR_INVALID_ARGUMENT && (ci.flags & LMXXF_NR_CREATE_FLAG_ACO) != 0) {
+        Log("mochizuki: this MochizukiNrRuntime.dll has no ACO; running without it");
+        ci.flags &= ~LMXXF_NR_CREATE_FLAG_ACO;
+        created = mz.api.Create(&ci, &s);
+    }
+    if (created != LMXXF_NR_OK)
+        return MzOff("Create");
+    // The runtime makes its own Vulkan instance here. ReShade's Vulkan layer, when it is installed
+    // system-wide, would wrap that instance as if it were a game's and report its device to every
+    // add-on, this one included. The layer's manifest names this variable as its off switch.
+    constexpr wchar_t kNoLayer[] = L"DISABLE_VK_LAYER_reshade_1";
+    wchar_t old[8]{};
+    const DWORD had = GetEnvironmentVariableW(kNoLayer, old, 8);
+    SetEnvironmentVariableW(kNoLayer, L"1");
+    const int32_t rc = mz.api.PrepareSession(s);
+    SetEnvironmentVariableW(kNoLayer, had != 0 && had < 8 ? old : nullptr);
+    if (rc != LMXXF_NR_OK) {
+        MzOff("PrepareSession");
+        mz.api.Destroy(s);
+        return false;
+    }
+    mz.session = s;
+    mz.device = g.device.Get();
+    // Up, as InitEngine says for danielblnc's: the raster pin (EnsureResources) holds only then, and
+    // without it every size a game flaps through re-rasters and drops the history.
+    g.engineReady = true;
+    Log("mochizuki: session ready. The first frames go out without the network while it is "
+        "built; the first time in each game that takes up to a minute (pipeline compilation).");
+    return true;
+}
+
+// The model's controls, from the same settings the danielblnc runtime reads: it is the same
+// network, so Structure, Tone, Skin, Style, the character mask and the per-pass profiles mean the
+// same. They go to the runtime's RenoDX stage (reno_*), which the runtime always runs and which
+// composes the picture itself, so Intensity and Colour go there too; the stage's other settings stay
+// at the runtime's defaults, as the OptiScaler fork leaves them. A runtime from before the stage reads
+// only the struct's front: the old fields are filled as before. Sent only on a change.
+void MzSendControls() {
+    if (mz.setControls == nullptr)
+        return;
+    MochizukiNrControls c = mz.defaults;
+    c.struct_size = sizeof c;
+    const PassTune first = TuningFor(0);
+    c.local_structure = first.structure;
+    c.local_tone = first.tone;
+    c.skin_structure = first.skin;
+    c.automatic_mask = g.settings.autoMask.load() != 0 ? 1u : 0u;
+    c.style = static_cast<uint32_t>(std::clamp(g.settings.style.load(), 0, 2));
+    // Encoding 0 hands the network the game's own sRGB values; 1 and 2 hand it linear light.
+    c.linear_input = g.settings.encoding.load() == 0 ? 2u : 1u;
+    for (UINT i = 1; i < State::kMaxPasses; ++i) {
+        const PassTune t = TuningFor(i);
+        MochizukiNrPassControls& p = c.pass[i - 1];
+        p.used = 1;
+        p.style = c.style;
+        p.intensity = c.intensity;
+        p.local_tone = t.tone;
+        p.local_structure = t.structure;
+        p.skin_structure = t.skin;
+        p.automatic_mask = c.automatic_mask;
+    }
+    const float intensity = std::clamp(g.settings.intensity.load(), 0.0f, 2.0f);
+    c.renodx = 1;
+    c.reno_nr_enabled = 1;
+    c.reno_intensity = intensity;
+    c.reno_style = c.style;
+    c.reno_local_tone = std::clamp(first.tone, 0.0f, 2.0f);
+    c.reno_local_structure = std::clamp(first.structure, 0.0f, 2.0f);
+    c.reno_skin_structure = std::clamp(first.skin, -1.0f, 1.0f);
+    c.reno_auto_mask = c.automatic_mask;
+    c.reno_passes = static_cast<uint32_t>(std::clamp(g.settings.passes.load(), 1, 3));
+    c.reno_color_strength = std::clamp(g.settings.colourStrength.load(), 0.0f, 1.0f);
+    // On Encoding 0 the frame arrives as 8-bit sRGB (MzToSdr); said outright all the same.
+    c.reno_source_encoding = g.settings.encoding.load() == 0 ? 1u : 2u;
+    // A later pass follows pass 1 unless it has a profile of its own (or the taper gives it one). Pass 1's
+    // Local tone is then the stage's on every pass, as RenoDX does it, where danielblnc gives later ones 0.
+    struct Pass {
+        uint32_t *follow, *style, *mask;
+        float *intensity, *tone, *structure, *skin;
+    } later[] = {
+        {&c.reno_pass_follow_0, &c.reno_pass_style_0, &c.reno_pass_auto_mask_0,
+         &c.reno_pass_intensity_0, &c.reno_pass_local_tone_0, &c.reno_pass_local_structure_0,
+         &c.reno_pass_skin_structure_0},
+        {&c.reno_pass_follow_1, &c.reno_pass_style_1, &c.reno_pass_auto_mask_1,
+         &c.reno_pass_intensity_1, &c.reno_pass_local_tone_1, &c.reno_pass_local_structure_1,
+         &c.reno_pass_skin_structure_1},
+    };
+    for (UINT i = 1; i < State::kMaxPasses && i <= std::size(later); ++i) {
+        const PassTune t = TuningFor(i);
+        const Pass& p = later[i - 1];
+        *p.follow = g.settings.passOverride[i].load() || g.settings.passTaper.load() ? 0u : 1u;
+        *p.style = c.style;
+        *p.mask = c.automatic_mask;
+        *p.intensity = intensity;
+        *p.tone = std::clamp(t.tone, 0.0f, 2.0f);
+        *p.structure = std::clamp(t.structure, 0.0f, 2.0f);
+        *p.skin = std::clamp(t.skin, -1.0f, 1.0f);
+    }
+    if (mz.sentValid && std::memcmp(&c, &mz.sent, sizeof c) == 0)
+        return;
+    if (mz.setControls(mz.session, &c) != LMXXF_NR_OK) {
+        MzSay("SetControls");
+        return;
+    }
+    mz.sent = c;
+    mz.sentValid = true;
+    Log("mochizuki: controls style %u, intensity %.2f, colour %.2f, structure %.2f, tone %.2f, skin %.2f, mask %u, "
+        "passes %u, source %s",
+        c.reno_style, static_cast<double>(c.reno_intensity),
+        static_cast<double>(c.reno_color_strength), static_cast<double>(c.reno_local_structure),
+        static_cast<double>(c.reno_local_tone), static_cast<double>(c.reno_skin_structure),
+        c.reno_auto_mask, c.reno_passes, c.reno_source_encoding == 1 ? "SDR" : "linear");
+}
+
+// The network the frames ask for: int4 mixed runs as ACO's machine code only and is made from the 310.8
+// model, so it takes that model with it, as the OptiScaler fork's menu does. A change rebuilds the network.
+uint32_t MzFrameFlags() {
+    const bool int4 = g.settings.mzInt4.load() && g.settings.mzAco.load();
+    return (int4 ? LMXXF_NR_FRAME_FLAG_INT4 : 0u) |
+           (int4 || g.settings.mzOriginalModel.load() ? LMXXF_NR_FRAME_FLAG_ORIGINAL_MODEL : 0u);
+}
+
+#include "mochizuki_sdr.inc"
+
+// PrepareFrame refused a frame. While a network builds that is the build; with none under way the
+// runtime has turned the network down -- a Scale or Passes change it freed the old network for and then
+// could not build the new one for ("insufficient VRAM ... free 0 MB"), retrying every 10 s while the
+// panel said it was running. Said as refused; after 3 s of it at a Scale or Passes other than the last
+// the network ran at, those come back, so it builds what it built before.
+void MzRefused() {
+    MochizukiNrInfo info{};
+    info.struct_size = sizeof info;
+    if (mz.getInfo != nullptr && mz.getInfo(mz.session, &info) == LMXXF_NR_OK && info.building != 0) {
+        mz.refusedSince = 0;
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (mz.refusedSince == 0)
+        mz.refusedSince = now;
+    char err[256]{};
+    if (mz.api.GetLastError != nullptr)
+        mz.api.GetLastError(err, sizeof err);
+    mz.refusal = err;
+    const float scale = g.settings.scale.load();
+    const int passes = g.settings.passes.load();
+    if (now - mz.refusedSince < 3000 || mz.goodPasses == 0 || (scale == mz.goodScale && passes == mz.goodPasses))
+        return;
+    g.settings.scale.store(mz.goodScale);
+    g.settings.passes.store(mz.goodPasses);
+    char line[160]{};
+    std::snprintf(line, sizeof line, "Scale %.2f, Passes %d refused; back to Scale %.2f, Passes %d",
+                  static_cast<double>(scale), passes, static_cast<double>(mz.goodScale), mz.goodPasses);
+    mz.reverted = line;
+    mz.refusedSince = 0;
+    // Into amd-nr.ini as well: the overlay saved the refused values as they settled, and the next
+    // launch would build at them again with nothing here to put them back.
+    static _locale_t c = _create_locale(LC_NUMERIC, "C");
+    wchar_t v[32]{};
+    const std::wstring ini = (ExeDirectory() / L"amd-nr.ini").wstring();
+    if (c != nullptr && _swprintf_s_l(v, 32, L"%.4g", c, static_cast<double>(mz.goodScale)) > 0)
+        WritePrivateProfileStringW(L"amd-nr", L"Scale", v, ini.c_str());
+    WritePrivateProfileStringW(L"amd-nr", L"Passes", std::to_wstring(mz.goodPasses).c_str(), ini.c_str());
+    Log("mochizuki: the network was refused for 3 s at Scale %.2f, Passes %d (%s); back to Scale %.2f, "
+        "Passes %d, the last it ran at", static_cast<double>(scale), passes, err,
+        static_cast<double>(mz.goodScale), mz.goodPasses);
+}
+
+// Runs the network on netColour in place. `accepted` stays 0 on a frame that goes without it (the
+// network still building, a refused format). False only when the list could not be carried on.
+bool MzRecord(ID3D12GraphicsCommandList*& cmd, bool haveMotion, UINT passes,
+              const SubmitPassFn& submitPass, UINT& accepted) {
+    if (mz.lastJob != nullptr) {
+        mz.api.Retire(mz.session, mz.lastJob);
+        mz.lastJob = nullptr;
+    }
+    MzSendControls();
+    LmxxfNrFrameInfo fi{};
+    fi.struct_size = sizeof fi;
+    fi.frame_id = g.status.frame;
+    fi.command_list = cmd;
+    fi.color_width = g.netWidth;
+    fi.color_height = g.netHeight;
+    ID3D12Resource* colour = g.settings.encoding.load() == 0 ? MzToSdr(cmd) : g.netColour.Get();
+    if (colour == nullptr) {
+        MzSay("no 8-bit copy of the frame");
+        return true;
+    }
+    fi.color = colour;
+    fi.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    fi.model_scale = 1.0f;
+    fi.passes = passes;
+    // netMotion is in pixels of the network's raster, pointing to where the pixel was: the NGX
+    // convention the runtime takes, at a scale of one.
+    if (haveMotion && g.settings.useHistory.load() && g.netMotion != nullptr) {
+        fi.flags = LMXXF_NR_FRAME_FLAG_TEMPORAL;
+        fi.motion = g.netMotion.Get();
+        fi.motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        fi.motion_scale_x = 1.0f;
+        fi.motion_scale_y = 1.0f;
+    }
+    fi.flags |= MzFrameFlags();
+    fi.reset = (g.historyValid.load() & 1u) == 0 ? 1u : 0u;
+    // Without first_pass_output: no person protection here, and a runtime from before it takes only this size.
+    LmxxfNrJob job{offsetof(LmxxfNrJob, first_pass_output), nullptr, nullptr};
+    if (mz.api.PrepareFrame(mz.session, &fi, &job) != LMXXF_NR_OK) {
+        MzSay("frame without the network");
+        MzRefused();
+        return true;
+    }
+    if (mz.api.RecordInputs(mz.session, job.handle, cmd) != LMXXF_NR_OK) {
+        MzSay("RecordInputs");
+        mz.api.CancelUnsubmitted(mz.session, job.handle);
+        return true;
+    }
+    // The network has to find the copies done, so the first half goes to the queue now.
+    if (!submitPass || !submitPass()) {
+        mz.api.CancelUnsubmitted(mz.session, job.handle);
+        g.status.failed = true;
+        Log("mochizuki: could not submit the list ahead of the network. Stopping.");
+        return false;
+    }
+    mz.api.EnqueueHip(mz.session, job.handle, g.queue.Get());
+    if (mz.api.RecordOutputs(mz.session, job.handle, cmd) != LMXXF_NR_OK) {
+        MzSay("RecordOutputs");
+        mz.lastJob = job.handle;
+        return true;
+    }
+    auto* result = static_cast<ID3D12Resource*>(job.private_output);
+    if (colour != g.netColour.Get()) {
+        MzConvert(cmd, 52, result, g.netColour.Get());
+    } else {
+        Barrier(cmd, result, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Barrier(cmd, g.netColour.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+        cmd->CopyResource(g.netColour.Get(), result);
+        Barrier(cmd, g.netColour.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cmd, result, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    mz.lastJob = job.handle;
+    const bool resumed = !mz.said.empty();  // the first frame run after frames without the network
+    if (resumed) {
+        mz.said.clear();
+        Log("mochizuki: the network is running");
+    }
+    g.historyValid.fetch_or(1u);
+    accepted = passes;
+    mz.refusedSince = 0;
+    MochizukiNrInfo info{};
+    info.struct_size = sizeof info;
+    // A runtime without MochizukiNrGetInfo cannot name the network's size: the values at the first frame
+    // after frames without the network (a build, as a rule) stand in, so the revert still has something.
+    if (mz.getInfo == nullptr ? resumed || mz.goodPasses == 0
+                              : mz.getInfo(mz.session, &info) == LMXXF_NR_OK &&
+                                    (info.frame_w != mz.builtW || info.frame_h != mz.builtH ||
+                                     info.max_passes != mz.builtPasses)) {
+        mz.builtW = info.frame_w, mz.builtH = info.frame_h, mz.builtPasses = info.max_passes;
+        mz.goodScale = g.settings.scale.load();
+        mz.goodPasses = g.settings.passes.load();
+    }
+    return true;
+}
+
+// The danielblnc network's GPU time for the last frame: each pass's last finished job, added up.
+float DanielblncMs() {
+    float sum = 0.0f;
+    for (UINT i = 0; i < g.activePasses && i < State::kMaxPasses; ++i)
+        sum += At<float>(RuntimeFor(i), rt::B->kNetworkMs);
+    return sum;
+}
+
+// For the panel: the runtime choice, and the status column line of the runtime in use.
+void MzStatus(PanelStatus& st) {
+    const bool selected = MzSelected();
+    st.runtimeActive = mz.selected;
+    st.runtimeChosen = mz.chosen;
+    st.mochizukiCrashed = mz.crashed;
+    for (int r = 0; r < runtime_choice::kCount; ++r)
+        st.runtimeInstalled[r] = mz.installed[r];
+    if (!selected && g.runtime != nullptr) {
+        st.danielblnc = rt::B->kVersion;
+        st.danielblncMs = DanielblncMs();
+        st.hasQuality = rt::B->kQuality != 0;
+    }
+    if (!selected)
+        return;
+    st.mochizuki = 1;
+    st.mochizukiModels = mz.models;
+    // A revert is news until Scale or Passes moves again.
+    if (g.settings.scale.load() != mz.goodScale || g.settings.passes.load() != mz.goodPasses)
+        mz.reverted.clear();
+    st.mochizukiNote = mz.reverted;
+    MochizukiNrInfo info{};
+    info.struct_size = sizeof info;
+    if (mz.session == nullptr || mz.getInfo == nullptr ||
+        mz.getInfo(mz.session, &info) != LMXXF_NR_OK)
+        return;
+    // info.frames counts the session's whole life, so a refused network still read as running.
+    st.mochizuki = info.failed != 0                         ? 3
+                   : info.building == 0 && mz.refusedSince != 0 ? 4
+                   : info.building != 0 || info.frames == 0  ? 1
+                                                             : 2;
+    if (st.mochizuki == 4)
+        st.mochizukiNote = mz.refusal;
+    st.mochizukiMs = info.gpu_ms_median;
+}
+
+void MzChoose(const PanelActions& actions) {
+    if (actions.runtime < 0 || actions.runtime >= runtime_choice::kCount ||
+        actions.runtime == mz.chosen)
+        return;
+    mz.chosen = actions.runtime;
+    runtime_choice::Write(ExeDirectory(), mz.chosen);
+    Log("menu: NR runtime %s from the next launch",
+        mz.chosen == runtime_choice::kMochizuki ? "mochizuki" : "danielblnc");
+}

@@ -1,0 +1,182 @@
+﻿# Builds the add-ons with the MSVC cl.exe directly, no Visual Studio project.
+# Produces a .addon64, which ReShade loads by extension.
+#
+# The toolchain is discovered: Visual Studio through vswhere, the Windows SDK through the
+# registry. Override either with -VsPath / -SdkPath if discovery picks the wrong one.
+
+param(
+    [string]$Target = 'neural',
+    [string]$VsPath = '',
+    [string]$SdkPath = '',
+    [string]$SdkVersion = '',
+    # Targets are ReShade add-ons by default. -Exe builds a console program instead, for the
+    # harnesses that answer a question without needing a host to inject into.
+    [switch]$Exe,
+    # x86 is for the hostcheck pair only, which drives the 32-bit bridge the way the x64 pair
+    # drives the add-on. The bridge itself builds through build-x86bridge.ps1.
+    [ValidateSet('x64', 'x86')][string]$Arch = 'x64',
+    # Lab only: a FidelityFX SDK checkout (the folder holding Kits\). Compiles its optical flow and
+    # DX12 backend into the target and defines AMDNR_WITH_FFX; the flow's shaders are generated first.
+    [string]$Ffx = ''
+)
+
+$ErrorActionPreference = 'Stop'
+$root = $PSScriptRoot
+
+# --- Visual Studio -----------------------------------------------------------------------
+if (-not $VsPath) {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path $vswhere)) {
+        throw "vswhere.exe not found. Install Visual Studio with the C++ workload, or pass -VsPath."
+    }
+    $VsPath = & $vswhere -latest -prerelease -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+        Select-Object -First 1
+}
+
+# vswhere does not see every install -- Insiders/preview builds in particular. Fall back to
+# scanning the standard locations for the tools themselves.
+if (-not $VsPath -or -not (Test-Path (Join-Path $VsPath 'VC\Tools\MSVC'))) {
+    $VsPath = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+        Where-Object { $_ } |
+        ForEach-Object { Join-Path $_ 'Microsoft Visual Studio' } |
+        Where-Object { Test-Path $_ } |
+        ForEach-Object { Get-ChildItem $_ -Directory -Recurse -Depth 1 -ErrorAction SilentlyContinue } |
+        Where-Object { Test-Path (Join-Path $_.FullName 'VC\Tools\MSVC') } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $VsPath) {
+    throw "No Visual Studio install with the C++ tools was found. Pass -VsPath."
+}
+
+$msvcRoot = Join-Path $VsPath 'VC\Tools\MSVC'
+if (-not (Test-Path $msvcRoot)) { throw "MSVC tools not found under $msvcRoot" }
+$msvc = Get-ChildItem $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+$cl = Join-Path $msvc.FullName "bin\Hostx64\$Arch\cl.exe"
+if (-not (Test-Path $cl)) { throw "cl.exe not found at $cl" }
+
+# --- Windows SDK -------------------------------------------------------------------------
+if (-not $SdkPath) {
+    foreach ($key in 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SDKs\Windows\v10.0',
+                     'HKLM:\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0') {
+        try { $SdkPath = (Get-ItemProperty $key -ErrorAction Stop).InstallationFolder } catch {}
+        if ($SdkPath) { break }
+    }
+}
+if (-not $SdkPath -or -not (Test-Path $SdkPath)) {
+    throw "Windows 10/11 SDK not found in the registry. Pass -SdkPath."
+}
+
+if (-not $SdkVersion) {
+    # Newest version that actually has the headers we need.
+    $SdkVersion = Get-ChildItem (Join-Path $SdkPath 'Include') -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName 'um\windows.h') } |
+        Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
+}
+if (-not $SdkVersion) { throw "No usable SDK version found under $SdkPath\Include. Pass -SdkVersion." }
+
+Write-Host "MSVC $($msvc.Name)"
+Write-Host "SDK  $SdkVersion  ($SdkPath)"
+
+# INCLUDE and LIB are environment variables, so spaces in these paths are fine.
+$env:INCLUDE = @(
+    (Join-Path $msvc.FullName 'include')
+    (Join-Path $SdkPath "Include\$SdkVersion\ucrt")
+    (Join-Path $SdkPath "Include\$SdkVersion\um")
+    (Join-Path $SdkPath "Include\$SdkVersion\shared")
+    (Join-Path $SdkPath "Include\$SdkVersion\winrt")
+    (Join-Path $root '3rdparty\reshade')
+    (Join-Path $root '3rdparty\minhook\include')
+) -join ';'
+
+$env:LIB = @(
+    (Join-Path $msvc.FullName "lib\$Arch")
+    (Join-Path $SdkPath "Lib\$SdkVersion\ucrt\$Arch")
+    (Join-Path $SdkPath "Lib\$SdkVersion\um\$Arch")
+) -join ';'
+
+# --- compile -----------------------------------------------------------------------------
+# x86 objects share their names with the x64 ones, so they get a folder of their own.
+$out = Join-Path $root $(if ($Arch -eq 'x86') { 'build-nr\x86' } else { 'build-nr' })
+New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+# Every target names its own sources. The path used to be derived as src\<target>\<target>.cpp,
+# which forced every target into a folder holding one file of the same name; a table lets a
+# source move or split without the target's name having to follow it.
+$minHook = @('buffer.c', 'hook.c', 'trampoline.c', 'hde\hde64.c') |
+    ForEach-Object { "3rdparty\minhook\src\$_" }
+# The panel, shared with the 32-bit bridge. Every .cpp under core\ui but its tests, so a new widget or section is a
+# new file and nothing here. Object files land flat in build\, so no two of them may share a name.
+$ui = Get-ChildItem (Join-Path $root 'core\ui') -Recurse -Filter *.cpp | Where-Object { $_.Directory.Name -ne 'tests' } |
+    ForEach-Object { $_.FullName.Substring($root.Length + 1) }
+$ffxSources = @()
+$ffxFlags = @()
+if ($Ffx) {
+    $sdk = (Resolve-Path $Ffx).Path
+    $kit = Join-Path $sdk 'Kits\FidelityFX'
+    $gen = Join-Path $root 'build\ffx-of'
+    $dxc = Join-Path $SdkPath "bin\$SdkVersion\x64\dxc.exe"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tools\gen_ffx_opticalflow.ps1') `
+        -SdkDirectory $sdk -OutputDirectory $gen -DxcPath $dxc
+    if ($LASTEXITCODE -ne 0) { throw "optical flow shader generation failed" }
+    $env:INCLUDE = (@($env:INCLUDE) + @('api\include', 'api\internal', 'backend\dx12', 'framegeneration\fsr3\include',
+        'framegeneration\fsr3\internal' | ForEach-Object { Join-Path $kit $_ }) + @($gen, (Join-Path $root 'core\temporal'))) -join ';'
+    $ffxSources = @('api\internal\ffx_assert.cpp', 'api\internal\ffx_message.cpp', 'api\internal\ffx_object_management.cpp',
+        'backend\dx12\ffx_backends_dx12.cpp', 'backend\dx12\ffx_dx12.cpp', 'framegeneration\fsr3\internal\ffx_opticalflow.cpp',
+        'framegeneration\fsr3\internal\ffx_opticalflow_shaderblobs.cpp') | ForEach-Object { Join-Path $kit $_ }
+    # _WINDOWS: the SDK's message code only compiles with it, as in the reference's build.
+    $ffxFlags = @('/DAMDNR_WITH_FFX=1', '/D_WINDOWS', '/wd4505', '/wd4201')
+}
+$targets = @{
+    'panelinput' = @('core\integration\panel_input.cpp')
+    'neural'     = @('core\addon\neural.cpp') + $ui + $minHook
+    # framecheck includes neural.cpp directly so it has the same Vulkan hook references as the add-on.
+    'framecheck' = @('core\diagnostics\framecheck\framecheck.cpp') + $ui + $minHook
+    'probe'      = @('core\diagnostics\probe\probe.cpp')
+    'session'    = @('core\diagnostics\session\session.cpp')
+    'glinfo'     = @('core\diagnostics\glinfo\glinfo.cpp')
+    'glprobe'    = @('core\diagnostics\glprobe\glprobe.cpp')
+    'vkprobe'    = @('core\diagnostics\vkprobe\vkprobe.cpp')
+    'vkbridge'   = @('core\diagnostics\vkbridge\vkbridge.cpp')
+    'hostcheck'  = @('core\diagnostics\hostcheck\hostcheck.cpp')
+    'hostcapture' = @('core\diagnostics\hostcheck\capture.cpp')
+}
+if (-not $targets.ContainsKey($Target)) {
+    throw "unknown target '$Target'; known: $(($targets.Keys | Sort-Object) -join ', ')"
+}
+$sources = @($targets[$Target] | ForEach-Object { Join-Path $root $_ })
+foreach ($s in $sources + $ffxSources) { if (-not (Test-Path $s)) { throw "source not found: $s" } }
+
+# The neural add-on is the product and carries the product's name; every other target is a
+# diagnostic and keeps its own, prefixed.
+$stem = if ($Target -eq 'neural') { 'amd-nr' } else { "amd-nr-$Target" }
+$dll = Join-Path $out $(if ($Exe) { "$stem.exe" } elseif ($Arch -eq 'x86') { "$stem.addon32" } else { "$stem.addon64" })
+
+Push-Location $out
+try {
+    # NOMINMAX: without it the max/min macros in windows.h swallow std::max/std::min.
+    # Link the CRT statically. Some games, including Detroit: Become Human, ship an older
+    # msvcp140.dll beside the executable; /MD lets that private copy override the runtime used
+    # to build the add-on and can make DllMain fail after ReShade has registered the module.
+    $common = @('/nologo', '/utf-8', '/std:c++20', '/EHsc', '/O2', '/MT', '/W3', '/DNDEBUG', '/DUNICODE', '/D_UNICODE',
+                '/D_CRT_SECURE_NO_WARNINGS', '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN') + $ffxFlags
+    # The SDK's sources compile on their own, with ffx_d3d12_module.h forced in: it points their
+    # GetModuleHandleW(L"D3D12.dll") at the module the add-on's device came from (see the header).
+    $ffxObjects = @()
+    if ($ffxSources.Count -gt 0) {
+        & $cl @common /c /FI"$(Join-Path $root 'core\temporal\ffx_d3d12_module.h')" /Fo"$out\" $ffxSources
+        if ($LASTEXITCODE -ne 0) { throw "FidelityFX compilation failed ($LASTEXITCODE)" }
+        $ffxObjects = $ffxSources | ForEach-Object { Join-Path $out ([IO.Path]::GetFileNameWithoutExtension($_) + '.obj') }
+    }
+    # No dxgi.lib for the add-on: it resolves its factory at first use (core/shared/dxgi_entry.h), and
+    # an import of it broke Dragon Age: Inquisition at start (tools/import_table_check.py).
+    & $cl @common `
+          /Fo"$out\" $(if (-not $Exe) { '/LD' }) $sources $ffxObjects /link $(if (-not $Exe) { '/DLL' }) /OUT:"$dll" `
+          user32.lib d3d11.lib d3d12.lib $(if ($Target -ne 'neural') { 'dxgi.lib' }) d3dcompiler.lib bcrypt.lib shell32.lib ole32.lib comctl32.lib
+    if ($LASTEXITCODE -ne 0) { throw "compilation failed ($LASTEXITCODE)" }
+} finally { Pop-Location }
+
+Write-Host ""
+Write-Host "OK: $dll"
+Get-Item $dll | Select-Object Name, Length, LastWriteTime

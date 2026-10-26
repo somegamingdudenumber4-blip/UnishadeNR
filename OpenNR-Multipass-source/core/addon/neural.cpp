@@ -1,0 +1,3149 @@
+// ReShade add-on: runs the DLSS-NR network over the presented frame on an AMD GPU via HIP.
+// D3D12 only. One core, one table row per target.
+
+#include <imgui.h>
+
+#include <reshade.hpp>
+
+#include <d3d11_4.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <d3dcompiler.h>
+#include <bcrypt.h>
+#include <wrl/client.h>
+
+#include "build_config.h"
+#include "../shared/hotkey_capture.h"
+#include "../shared/ini_text.h"
+#include "../shared/log_export.h"
+#include "../shared/guide_choice.h"
+#include "../shared/d3d11_guides.h"
+#include "../shared/d3d10_stage.h"
+#include "../shared/d3d10_compile_unhook.h"
+#include "../shared/stall_watch.h"
+#include "../shared/dxgi_entry.h"
+#include "../shared/raster_pin.h"
+#include "../shared/history_keys.h"
+#include "../ui/panel.h"
+#include "../shaders/motion.h"
+#include "../shaders/compose.h"
+#include "../shaders/input.h"
+#include "../temporal/ffx.h"
+#include "../ui/panel_model.h"
+#include "../ui/view_logic.h"
+#if AMDNR_WITH_VULKAN
+#include <MinHook.h>
+#include "../shared/vk_raw.inc"
+#endif
+
+#include <windows.h>
+#include <shlobj.h>
+
+#include <algorithm>
+#include <atomic>
+#include <clocale>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <mutex>
+#include <span>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+using Microsoft::WRL::ComPtr;
+using namespace reshade::api;
+
+namespace
+{
+// Only the consolidated host opts into preserving source detail in Network output mode.
+std::atomic<bool> g_preserveSourceDetail{false};
+
+#include "../transport/FrameTransport.hpp"
+
+enum class Tier
+{
+    A,
+    B,
+    C,
+};
+
+struct Profile
+{
+    const wchar_t *exe;
+    Tier tier;
+    float scale;
+    const char *note;
+};
+
+// Cosmetic only: nothing here gates behaviour. tier and scale go to the log, note goes to the
+// status line, and a game that is not listed runs exactly the same as one that is. It exists so
+// the log says which target a report came from, not to enable anything -- do not let it read as
+// a whitelist.
+constexpr Profile kTargets[] = {
+    { L"eurotrucks2.exe", Tier::C, 1.0f,
+      "Euro Truck Simulator 2" },
+
+    { L"pcsx2-qt.exe", Tier::C, 1.0f,
+      "PCSX2" },
+
+    { L"rpcs3.exe", Tier::C, 1.0f,
+      "RPCS3" },
+
+    { L"NFS16.exe", Tier::C, 1.0f,
+      "NFS 2015" },
+
+    { L"RDR2.exe", Tier::C, 1.0f,
+      "Red Dead Redemption 2" },
+
+    { nullptr, Tier::C, 1.0f,
+      "uncatalogued target (runs the same as a listed one)" },
+};
+
+const Profile &ProfileForThisProcess()
+{
+    static const Profile &chosen = []() -> const Profile & {
+        wchar_t path[MAX_PATH] {};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        const std::wstring exe = std::filesystem::path(path).filename().wstring();
+        for (const auto &t : kTargets)
+            if (t.exe != nullptr && _wcsicmp(t.exe, exe.c_str()) == 0)
+                return t;
+        return kTargets[std::size(kTargets) - 1];
+    }();
+    return chosen;
+}
+
+// The add-on must not drag d3d12.dll into a process that is not already using D3D12. A static
+// import is resolved when ReShade loads the add-on -- in the middle of ReShade's own start-up,
+// around the time the swapchain is created -- and that is when ReShade installs the delayed hooks
+// it has waiting for d3d12.dll.
+//
+// Measured on NFS 2015, which is D3D11: an add-on subscribing to nothing and running no code at
+// all still made the game's ResizeBuffers fail with DXGI_ERROR_INVALID_CALL, and the game quits
+// over that with a DirectX error box. The probe add-on, which imports no graphics library at all,
+// resized eight times in the same place without trouble. The import table was the only difference
+// left, and these four exports are the whole of it.
+//
+// So resolve them by hand, and only once something is actually going to be built. On a D3D12
+// target the game has already loaded d3d12.dll and this is just a reference count.
+HMODULE g_d3d12Module = nullptr, g_compilerModule = nullptr;
+decltype(&D3D12CreateDevice) p_D3D12CreateDevice = nullptr;
+decltype(&D3D12SerializeRootSignature) p_D3D12SerializeRootSignature = nullptr;
+pD3DCompile p_D3DCompile = nullptr;
+
+void Log(const char *fmt, ...);
+std::filesystem::path ExeDirectory();
+
+// Bringing d3d12.dll into a game that is not already using D3D12 is what broke this. ReShade
+// keeps a set of hooks waiting for that library and installs them the moment it arrives -- its
+// own log names it: "Installing delayed hooks for d3d12.dll (Just loaded via LoadLibrary)". Doing
+// that while a D3D11 swapchain is already live leaves the swapchain in a state DXGI will not
+// resize: the next ResizeBuffers returns DXGI_ERROR_INVALID_CALL, and a game that checks the
+// result -- NFS 2015 does -- puts up a DirectX error box and quits.
+//
+// Measured, on NFS, with the add-on otherwise doing nothing at all:
+//   d3d12.dll never loaded         -> 5 resizes, 0 failures, runs
+//   d3d12.dll loaded, no device    -> first resize afterwards fails, game quits
+// Creating the device is not needed to trigger it; the load alone does. Loading it below
+// LoadLibrary, through LdrLoadDll, does not help either, because ReShade is told about the module
+// by the loader's notification callback however it arrives.
+//
+// So the library has to arrive under a name ReShade has no hooks registered against. A private
+// copy beside the exe gets its own module identity -- module identity is the full path -- and
+// with it a clean export table: GetProcAddress then returns the real D3D12CreateDevice rather
+// than ReShade's, which also keeps our device out of ReShade's bookkeeping entirely. That is the
+// right relationship anyway: ReShade manages the game's device, this one is ours.
+//
+// A game already on D3D12 needs none of this. Its d3d12.dll is loaded and hooked long before the
+// add-on exists, and the handle is simply reused.
+// Exactly as many characters as "d3d12.dll". An import name lives in the file as a
+// null-terminated string, so a same-length replacement can be written straight over it -- which
+// is what lets the NR runtime be pointed at this copy instead of the system one.
+constexpr wchar_t kPrivateD3D12[] = L"dx12p.dll";
+static_assert(sizeof(kPrivateD3D12) == sizeof(L"d3d12.dll"));
+constexpr char kSystemD3D12Ansi[] = "d3d12.dll";
+constexpr char kPrivateD3D12Ansi[] = "dx12p.dll";
+
+// Null unless D3D12 had to be brought in privately. On a game already using D3D12 there is
+// nothing to avoid and everything below is skipped.
+const wchar_t *g_privateD3D12 = nullptr;
+
+HMODULE LoadPrivateD3D12()
+{
+    // A game already on D3D12 needs none of this: its d3d12.dll was loaded and hooked long before
+    // the add-on existed, and reusing the handle changes nothing.
+    if (HMODULE already = GetModuleHandleW(L"d3d12.dll"); already != nullptr)
+        return already;
+
+    wchar_t system32[MAX_PATH] {};
+    if (GetSystemDirectoryW(system32, MAX_PATH) == 0)
+        return LoadLibraryW(L"d3d12.dll");
+    const std::filesystem::path sys = system32;
+    const std::filesystem::path dir = ExeDirectory() / L"amd-nr-runtime";
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::filesystem::create_directories(dir / L"D3D12", ec);
+    auto place = [&](const wchar_t *from, const std::filesystem::path &to) {
+        std::error_code e;
+        const auto source = sys / from;
+        // Same size means a copy from an earlier run is still current. It may also be mapped by
+        // this very process already, which would make overwriting it fail for no good reason.
+        if (std::filesystem::exists(to, e) &&
+            std::filesystem::file_size(to, e) == std::filesystem::file_size(source, e))
+            return true;
+        std::filesystem::copy_file(source, to, std::filesystem::copy_options::overwrite_existing, e);
+        return std::filesystem::exists(to);
+    };
+
+    // D3D12.dll will not come up without its core component -- D3D12_ERROR_INVALID_REDIST,
+    // 0x887E0003, measured -- and a copy loaded from outside the system directory looks for that
+    // core beside itself, or in a D3D12 subdirectory, rather than back in System32. Provide both,
+    // and load with LOAD_WITH_ALTERED_SEARCH_PATH so its own directory is searched first.
+    if (!place(L"D3D12.dll", dir / kPrivateD3D12) ||
+        !place(L"D3D12Core.dll", dir / L"D3D12Core.dll"))
+    {
+        Log("could not place a private copy of D3D12; falling back to the system one, which will "
+            "upset a D3D11 game's next resize.");
+        return LoadLibraryW(L"d3d12.dll");
+    }
+    place(L"D3D12Core.dll", dir / L"D3D12" / L"D3D12Core.dll");
+
+    HMODULE loaded = LoadLibraryExW((dir / kPrivateD3D12).c_str(), nullptr,
+                                    LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (loaded == nullptr)
+    {
+        Log("the private D3D12 copy would not load (%lu); falling back to the system one.",
+            GetLastError());
+        return LoadLibraryW(L"d3d12.dll");
+    }
+    g_privateD3D12 = kPrivateD3D12;
+    Log("D3D12 loaded privately as %ls, so ReShade installs no d3d12 hooks over the live "
+        "swapchain.", kPrivateD3D12);
+    return loaded;
+}
+
+bool LoadGraphicsApi()
+{
+    if (p_D3D12CreateDevice != nullptr)
+        return true;
+    // The compiler is already in the process (ReShade uses it) and has no delayed hooks waiting,
+    // so it needs none of this.
+    g_compilerModule = GetModuleHandleW(L"d3dcompiler_47.dll");
+    if (g_compilerModule == nullptr)
+        g_compilerModule = LoadLibraryW(L"d3dcompiler_47.dll");
+    g_d3d12Module = LoadPrivateD3D12();
+    if (g_d3d12Module == nullptr || g_compilerModule == nullptr)
+    {
+        Log("d3d12.dll or d3dcompiler_47.dll could not be loaded; the add-on cannot run here.");
+        return false;
+    }
+    p_D3D12CreateDevice = reinterpret_cast<decltype(p_D3D12CreateDevice)>(
+        GetProcAddress(g_d3d12Module, "D3D12CreateDevice"));
+    p_D3D12SerializeRootSignature = reinterpret_cast<decltype(p_D3D12SerializeRootSignature)>(
+        GetProcAddress(g_d3d12Module, "D3D12SerializeRootSignature"));
+    p_D3DCompile = reinterpret_cast<pD3DCompile>(GetProcAddress(g_compilerModule, "D3DCompile"));
+    const bool ok = p_D3D12CreateDevice != nullptr && p_D3D12SerializeRootSignature != nullptr &&
+                    p_D3DCompile != nullptr;
+    if (!ok)
+    {
+        Log("one of the graphics entry points could not be resolved.");
+        p_D3D12CreateDevice = nullptr;
+    }
+    return ok;
+}
+
+std::mutex g_log_mutex;
+FILE *g_log = nullptr;
+
+void Log(const char *fmt, ...)
+{
+    std::lock_guard guard(g_log_mutex);
+    if (g_log == nullptr)
+        return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_log, fmt, args);
+    va_end(args);
+    fputc('\n', g_log);
+    fflush(g_log);
+}
+
+std::filesystem::path ExeDirectory()
+{
+    wchar_t path[MAX_PATH] {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    return std::filesystem::path(path).parent_path();
+}
+
+// Beside the game, where every report looks for it. A game under Program Files is not writable there
+// without elevation, and the log was simply missing (issue #22), so then %LOCALAPPDATA%\amd-nr, said
+// in the first line. Export logs looks in g_logDir first.
+std::filesystem::path &g_logDir = *new std::filesystem::path;  // never destroyed, like g
+void OpenLog()
+{
+    g_logDir = ExeDirectory();
+    g_log = _wfopen((g_logDir / L"amd-nr.log").c_str(), L"w");
+    const wchar_t *local = _wgetenv(L"LOCALAPPDATA");
+    if (g_log != nullptr || local == nullptr)
+        return;
+    std::error_code ec;
+    g_logDir = std::filesystem::path(local) / L"amd-nr";
+    std::filesystem::create_directories(g_logDir, ec);
+    g_log = _wfopen((g_logDir / L"amd-nr.log").c_str(), L"w");
+    Log("amd-nr.log could not be written in %ls, so it is in %ls", ExeDirectory().c_str(), g_logDir.c_str());
+}
+
+DXGI_FORMAT DepthReadFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_D32_FLOAT:            return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_D16_UNORM:            return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:    return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    default:                               return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+DXGI_FORMAT DepthAliasFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: return DXGI_FORMAT_R32G8X24_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT:                return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:    return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_UNORM:                return DXGI_FORMAT_R16_TYPELESS;
+    default:                                   return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+DXGI_FORMAT ColourReadFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:      return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:      return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:   return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:  return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:    return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:    return DXGI_FORMAT_B8G8R8A8_UNORM;
+    default:                                 return f;
+    }
+}
+
+// D3D12 guarantees typed UAV store for very few formats. B8G8R8A8_UNORM and R10G10B10A2_UNORM
+// are NOT among them -- they are optional per driver. A hardcoded table that assumes they work
+// means the compose shader writes through an unsupported UAV wherever they don't: undefined
+// behaviour, which shows up as a distorted picture and no error anywhere. Ask the device.
+bool HasTypedUavStore(ID3D12Device *dev, DXGI_FORMAT f)
+{
+    if (dev == nullptr)
+        return false;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT s {};
+    s.Format = f;
+    if (FAILED(dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &s, sizeof(s))))
+        return false;
+    return (s.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+}
+
+void Barrier(ID3D12GraphicsCommandList *c, ID3D12Resource *r, D3D12_RESOURCE_STATES a,
+             D3D12_RESOURCE_STATES b)
+{
+    if (r == nullptr || a == b)
+        return;
+    D3D12_RESOURCE_BARRIER v {};
+    v.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    v.Transition = { r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, a, b };
+    c->ResourceBarrier(1, &v);
+}
+
+// Every address written into the runtime lives in this header and nowhere else; its top says why.
+#include "runtime_offsets.h"
+
+template <class T> T &At(HMODULE h, size_t rva)
+{
+    return *reinterpret_cast<T *>(reinterpret_cast<uintptr_t>(h) + rva);
+}
+
+struct Packet
+{
+    ID3D12GraphicsCommandList *list;
+    ID3D12Resource *colour;
+    UINT colourState, pad14;
+    ID3D12Resource *motion;
+    UINT motionState, pad24;
+    ID3D12Resource *depth;
+    UINT depthState, pad34;
+    ID3D12Resource *exposure;
+    UINT exposureState;
+    float scaleX, scaleY;
+    UINT pad4c;
+    UINT renderWidth, renderHeight; // read since v0.4.1, as the jitter below always is (names as the
+    float jitterX, jitterY;         // OptiScaler fork's): zero here, no longer whatever the stack held
+    // danielblnc 0.6.0 reads one float past those, FSR's pre-exposure (UsePreExposure=1, its default;
+    // `movss xmm0, [rsi+0x60]` in Record). A 0x60-byte packet handed it stack bytes, the green noise the
+    // OptiScaler fork met. The colour goes in as the game shows it, so 1; older builds stop at 0x60.
+    float preExposure;
+    UINT pad64;
+};
+static_assert(sizeof(Packet) == 0x68 && offsetof(Packet, scaleX) == 0x44 && offsetof(Packet, jitterX) == 0x58 &&
+              offsetof(Packet, preExposure) == 0x60);
+
+using InitFn = bool(__fastcall *)(void *, const std::string *);
+using RecordFn = void(__fastcall *)(Packet *);
+using NotifyFn = void(__fastcall *)(ID3D12CommandQueue *, UINT, ID3D12CommandList *const *);
+using HipSetFn = int (*)(int);
+
+// One texture that lives on both devices at once. Created on D3D11 (the game's device owns it),
+// shared by NT handle, opened on ours. Ported from session.cpp, where this transport is measured
+// and working: submit 0.21-0.27 ms, return 0.066 ms.
+struct Bridge
+{
+    const char *name = "";
+    ComPtr<ID3D11Texture2D> on11;
+    HANDLE handle = nullptr;
+    ComPtr<ID3D12Resource> on12;
+    UINT width = 0, height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+    void Destroy()
+    {
+        on12.Reset();
+        if (handle != nullptr)
+            CloseHandle(handle);
+        handle = nullptr;
+        on11.Reset();
+        width = height = 0;
+        format = DXGI_FORMAT_UNKNOWN;
+    }
+
+    bool Ensure(ID3D11Device5 *game11, ID3D12Device *own, UINT w, UINT h, DXGI_FORMAT fmt,
+                bool uav = false)
+    {
+        if (on12 != nullptr && width == w && height == h && format == fmt)
+            return true;
+        Destroy();
+        D3D11_TEXTURE2D_DESC td {};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = fmt;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0u);
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+        HRESULT hr = game11->CreateTexture2D(&td, nullptr, &on11);
+        if (FAILED(hr))
+        {
+            Log("bridge %s: CreateTexture2D %ux%u fmt %u failed 0x%08lX.", name, w, h,
+                static_cast<unsigned>(fmt), hr);
+            return false;
+        }
+        ComPtr<IDXGIResource1> res;
+        if (FAILED(on11.As(&res)) ||
+            FAILED(res->CreateSharedHandle(
+                nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle)) ||
+            FAILED(own->OpenSharedHandle(handle, IID_PPV_ARGS(&on12))))
+        {
+            Log("bridge %s: sharing failed.", name);
+            // The texture is alive by here, and the handle may be too. Ensure calls Destroy() on
+            // the way in, so a retry would reclaim them -- but the depth path latches instead of
+            // retrying, and a failure path should not depend on someone else trying again.
+            Destroy();
+            return false;
+        }
+        width = w;
+        height = h;
+        format = fmt;
+        Log("bridge %s ready: %ux%u fmt %u, shared D3D11 <-> D3D12", name, w, h,
+            static_cast<unsigned>(fmt));
+        return true;
+    }
+};
+
+// A guide buffer the game itself renders -- depth, or real motion vectors -- carried from the
+// game's D3D11 device to ours. This is the whole difference between what PCSX2 can feed the
+// network and what a modern engine can: PS2 has no velocity buffer at all and its depth only
+// exists between a bind and a clear, so the add-on had to *estimate* motion from the image and
+// go without depth. Frostbite writes both every frame, at screen resolution, and leaves them
+// readable at present time. Three of the Packet's four slots become real instead of one.
+//
+// One copy per frame, taken at present (or, once the probe withheld that, just before the game's
+// last clear: d3d11_guides.h). The copy is what makes it safe to read: the game keeps binding and
+// clearing its own buffer, and a view kept on the live resource reads what the next pass left.
+struct Guide
+{
+    const char *name = "";
+    // What the bind observation picked, and how often the game bound it. Most-bound wins: the
+    // main scene pass outbinds shadow maps and reflection probes by an order of magnitude.
+    ComPtr<ID3D11Resource> chosen;
+    UINT chosenBinds = 0;
+    // Who is trying to take the slot, and for how many presents running. Identity only -- never
+    // dereferenced, and cleared the moment it stops winning -- so no reference is needed.
+    ID3D11Resource *challenger = nullptr;
+    UINT challengerFrames = 0;
+    // Presents counted before the first guide is taken at all. Separate from the challenger
+    // streak because the cold start is a different question: see SettleGuide.
+    UINT coldFrames = 0;
+    UINT width = 0, height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+    // Set when the companion effect supplied this guide instead of the bind observation. The
+    // tally then has nothing to say about it: a ReShade effect texture is never bound as a
+    // render target the add-on can see, so SettleGuide would walk the slot straight back onto
+    // whatever the game happened to draw into most.
+    bool external = false;
+
+    ComPtr<ID3D11Texture2D> snap;  // private, never bound as a target, so an SRV over it survives
+    UINT snapW = 0, snapH = 0;
+    DXGI_FORMAT snapFmt = DXGI_FORMAT_UNKNOWN;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    ID3D11Texture2D *srvOf = nullptr;
+    ComPtr<ID3D11UnorderedAccessView> uav;
+    ID3D11Texture2D *uavOf = nullptr;
+
+    Bridge bridge;
+    ComPtr<ID3D12Resource> local;  // our own copy, so SRV reads never lean on state promotion
+    bool ready = false, logged = false, failed = false;
+    bool preClear = false, snapFresh = false, presentRetried = false;  // d3d11_guides.h
+};
+
+// The guide selection -- Tallied, SettleGuide, the size floor, what counts as motion or as
+// readable depth -- is guide_choice.h, shared with the 32-bit bridge. Never destroyed, as g is.
+using namespace guides;
+auto &g_depthTally = *new d3d11guides::TallyMap, &g_motionTally = *new d3d11guides::TallyMap;
+
+// The optional-control bits (ui::Opt), the section hues, T and the widgets are the panel's, in
+// core/ui/, shared with the 32-bit bridge. Unqualified here so the code that reads them reads the
+// same as it did when they were defined in this file.
+using namespace ui;
+
+struct State
+{
+    std::mutex lock;
+
+    // Local x64/Unishade experiment: five serial passes for deliberately exaggerated rendering.
+    // Each pass retains its own runtime/history. Keep the runtime's watchdogs and failure limits.
+    // This build is distributed separately; the upstream/default installation remains at three.
+    static constexpr UINT kMaxPasses = 5;
+    static_assert(kMaxPasses == ui::kMaxPasses);
+
+    // Whether this run is up. Every transport fails the same way: say why, leave the frame alone.
+    struct StatusState
+    {
+        bool unavailable = false, loggedWrongApi = false, failed = false;
+        bool loggedOtherSwapchain = false;  // said again when the first one takes the latch back
+        const char *reason = "";
+        uint64_t frame = 0, skipped = 0;
+        uint64_t idle = 0;  // presents the network was asked for and no pass ran on (refused, building)
+        // The last present went to a window nobody can see: alt-tab, in practice, and the state
+        // in which every wait in this file misbehaves.
+        bool windowHidden = false, loggedHidden = false;
+    } status;
+    // What the ini and the panel set. The settings table (settings_fields.inc) is the list both
+    // routes share, and the one place each of its rows has an ini key, a default and a range; the
+    // rest are this add-on's own restart-only knobs.
+    struct SettingsState
+    {
+        // So the table's rows start at its defaults, the ones LoadSettings falls back to and
+        // Factory Defaults restores; none is written again beside its field below.
+        SettingsState()
+        {
+#define X(type, name, key, def, low, high) name.store(static_cast<decltype(name.load())>(def));
+#include "../x86bridge/settings_fields.inc"
+#undef X
+        }
+        // Starts off unless StartOn says otherwise. The add-on rewrites every presented frame, and
+        // the settings that do that are the ones that have taken the machine down, so the shipped
+        // default is still off -- but "off every single launch" was a diagnostic's rule, not a
+        // user's, and somebody who has already chosen their settings should not have to press a key
+        // every time. StartOn is a normal setting now: in the overlay, and written back.
+        std::atomic<bool> enabled;
+        std::atomic<bool> startOn;
+        // Which key toggles the effect. A virtual-key code plus a modifier mask: 1 Ctrl, 2 Alt,
+        // 4 Shift. Ctrl+End is the default because that is what every note, log line and README
+        // already says. A bare key with no modifier is allowed and is the user's business -- it will
+        // fire during normal play if they bind a letter. Not text: parsing "Ctrl+End" back into a key
+        // is a table that is wrong on the first non-US layout, and the overlay captures a keypress.
+        std::atomic<int> toggleKey;
+        std::atomic<int> toggleMods;
+        // Switch the effect off when the game stops being the focused window, and leave it off.
+        //
+        // Not a pause. Coming back to a game that quietly resumed rewriting every frame is the
+        // surprise; being handed the game's own image and turning the effect back on deliberately is
+        // the point. The hotkey brings it back.
+        //
+        // Separate from the minimised handling further down, which is an unconditional safety and
+        // does resume on its own: nothing we draw is visible while minimised and every wait in this
+        // file misbehaves there, so sitting those frames out is never a user-visible decision.
+        std::atomic<bool> disableOnAltTab;
+        std::atomic<float> structure;
+        std::atomic<float> tone;
+        // -1, not 1. It is the value the engine boots with and it means "derive it from local
+        // structure" -- a mode, not a strength. Shipping 1.0 here wrote that automatic off on
+        // startup, before anybody had touched a control, while the overlay's own tooltip said the
+        // add-on had stopped doing exactly that.
+        std::atomic<float> skin;
+        std::atomic<int> passes;
+        std::atomic<bool> serialPasses;
+        // 0 English, 1 Portugues do Brasil. English by default.
+        std::atomic<int> language;
+        // A bit per optional control, saying whether the panel draws a widget for it. Nothing else:
+        // every one of them is live and settable from the ini whether its bit is set or not. The
+        // cascade at the bottom of the panel is what turns them on, one at a time, so a panel grows
+        // by what somebody asked for rather than by everything that exists. See enum Opt.
+        std::atomic<uint32_t> optional;
+        // The engine's own option struct (runtime_offsets.h), mapped by decompiling its ini reader
+        // rather than guessed. The four below were never written by this add-on, and two fields
+        // were written wrong. Their defaults are the engine's own, so leaving them alone changes
+        // nothing.
+        std::atomic<int> autoMask;
+        std::atomic<int> toneChannels;
+        std::atomic<float> engineScale;
+        // -1 follows the selected input encoding. Our FP16 transport is also used
+        // for SDR, so the runtime's format-based auto detection alone is incorrect.
+        std::atomic<int> tonemap;
+        // 0 follow the guides, 1 force off, 2 force on.
+        std::atomic<int> temporalMode;
+        std::atomic<float> scale;
+        std::atomic<bool> inlineMode;
+        std::atomic<int> encoding;
+        // 100 nits is the automatic ShortFuse documents for linear BT.709; the old 500 here
+        // matched none of the documented conventions (100 / 203 / 250).
+        std::atomic<float> diffuseWhite;
+        std::atomic<float> intensity;
+        // Two limits on the correction itself, applied in compose after the intensity mix. The
+        // network is tiled and the tiles at the frame border are extrapolated on one side, so the
+        // correction there is invented rather than seen; bicubic upsampling rings on top of it. The
+        // report is specks and crawling colour in the corners. limit caps a single pixel of
+        // correction, fade rolls the whole correction off over a border band. Both default to off,
+        // so nothing changes until they are turned up.
+        // Measured, not chosen: a two-pass run on God of War reported a mean correction of 0.072 with
+        // a **maximum of 4.16**, against a picture whose own mean is 0.13. A correction four times
+        // brighter than white is not something the network saw, it is a tile where it extrapolated --
+        // and it is exactly the blown block on screen. Off was the old default and it let all of that
+        // through. 0.25 is still more than three times the typical correction, so an ordinary pixel
+        // never meets it.
+        std::atomic<float> residualLimit;
+        std::atomic<float> residualFade;
+        // Halve Structure for each later pass. Ours, not the reference's -- upstream leaves structure
+        // at full on every pass and only zeroes Local Tone after the first, which this now does by
+        // default. Off, because the residual measurement says the chain compounds (one pass is a mean
+        // of 0.021, two is 0.072) but nothing here has measured that halving structure is the right
+        // answer to that, and matching the reference is worth more than an unmeasured idea.
+        //
+        // Confirmed in execution, not just in their source. Their per-pass parameter readback prints
+        // Intensity 1, LocalStructure 1, SkinStructure -1 on pass 1 and the identical three on pass
+        // 2, with only LocalTone going 1 -> 0. Their ini says it in one line: "Omitted controls
+        // inherit pass 1, except later-pass local tone defaults to 0." Nothing tapers over there.
+        std::atomic<bool> passTaper;
+        // How the network's answer is put back onto the frame. Above zero this is the highlight
+        // guard -- the most compose may move a pixel's luminance, in either direction -- and it
+        // doubles as the switch: zero selects the old additive composition, which is kept only so
+        // the two can be compared inside one session.
+        //
+        // Additive is what made Pass Count useless. Two passes is twice the difference and three is
+        // three times it, added per channel and then clipped per channel, and a clipped channel is a
+        // hue rotation -- so the count did not read as more detail, it read as more saturation and
+        // then as garbage. The ratio path bounds luminance instead and leaves hue to a blend between
+        // two finished pictures, which is what the OptiScaler DLSS-NR fork does and where the
+        // arrangement comes from. 2.0 is that fork's own default.
+        std::atomic<float> ratioGuard;
+        // The guard is applied once, to the finished composition, while the passes compound the
+        // ratio it bounds. Left fixed, the third pass spends most of its contribution against the
+        // clamp -- the fork's own tooltip says to raise it by hand with the count. Doing it here
+        // instead means one extra pass buys one extra multiple of headroom.
+        //
+        // Off by default, and that is now a reading rather than a preference. Nine OptiScaler logs
+        // from RTX machines carry 254 'composition:' lines across seven games, at one and at two
+        // passes, and every one of them says guard 2.0x -- the single 1.5x in the set is a user who
+        // dragged the slider down. The reference ini says the same in its own words: MaxRatio,
+        // "Default (auto) is 2.0", with no mention of the pass count. So the shipped behaviour over
+        // there is a fixed bound at every count, and matching it is worth more than our idea about
+        // headroom. The idea stays available as a switch; it is just not what runs unasked.
+        std::atomic<bool> guardTracksPasses;
+        // Whether the network's colour arrives with its light. Both ends of the blend carry the same
+        // luminance, so this cannot shift hue on its own: at 0 every pixel keeps the game's exact
+        // colour and only its brightness carries the network's verdict.
+        std::atomic<float> colourStrength;
+        // danielblnc's Style, the network's style input: 0 Default, 1 Natural, 2 Cinematic.
+        std::atomic<int> style;
+        // No longer read: the grade it scaled is gone. Kept because the 32-bit wire carries it.
+        std::atomic<float> styleStrength;
+        std::atomic<bool> bicubic;
+        // Show the network's own answer instead of composing it onto the game's frame.
+        //
+        // This is the picture the Debug View "Network output" always drew; it is here as a mode
+        // because on the D3D12 route it was the one that looked right, and a thing people run for
+        // hours should not live in a diagnostics dropdown. It is not a better composition -- it is
+        // no composition. Highlight Guard, Colour Strength and both residual limits are bypassed
+        // entirely, because there is no residual for them to bound.
+        std::atomic<bool> networkOutput;
+        std::atomic<int> debugView;
+        std::atomic<bool> measureNow { false };
+        int diagnostics = 0;  // bits: 1 the Ctrl+Home/PageDown keys, 2 a stats line a second
+        bool capturePair = false;
+        std::atomic<float> flowGate;
+        std::atomic<float> flowRatio;
+        std::atomic<bool> useMotion;
+        std::atomic<bool> useHistory;
+        std::atomic<bool> useDepth;
+        std::atomic<bool> useGameGuides;
+        // Frostbite stores velocity as a UV-space delta; the engine reads motion in raster pixels,
+        // so the field is multiplied by the target size. Sign and magnitude are engine convention,
+        // not something that can be read off the resource, so leave the knob: -1 flips the direction,
+        // and a value other than 1 rescales. Watch Debug View "Motion vectors" while panning.
+        std::atomic<float> motionScale;
+        // Lab: FidelityFX optical flow as the motion source. See core/temporal/optical_flow.inc.
+        std::atomic<int> opticalFlow { 0 };
+        std::atomic<float> motionMaxPx { 0.0f };
+        std::atomic<int> historyGuard { 0 };  // Lab: the reference's history filters, core/temporal/smooth.inc
+        std::atomic<float> outputSmooth, outputSmoothLimit;
+        std::atomic<int> fixedSeed;  // Lab: the pre-block's noise seed pinned, core/temporal/seed.inc
+        std::atomic<int> quality;    // the runtime's Quality, 1 fast, 0 reference (kQuality)
+        // DepthInverted. 1 is both runtimes' own default; RenoDX writes 0 explicitly on its
+        // Present route (ETS2 trace, where its depth was a dummy, so that 0 says nothing about any
+        // game's real buffer). Exposed so the two can be told apart on a game with real depth; no run
+        // here has yet.
+        std::atomic<bool> depthInverted;
+        // The same measurement, on the path the network actually reads. The probe was already
+        // computing 1/max for the debug view and throwing it away everywhere else, so the guide the
+        // network got was the raw buffer: on PCSX2 that is 0..0.002, which is 0.2% of the range and
+        // flat as far as the network is concerned. Left at 1.0 until something has been measured,
+        // and only moved when the measured range is far enough below full that it is a defect
+        // rather than a scene -- a modern engine fills the range and keeps 1.0.
+        // Off. It shipped on, and its own help text said it reads as the wrong operation on this
+        // bench: PCSX2's depth already has its bulk at the top of its own tiny range, so scaling
+        // by 1/max lands nearly every pixel at 0.99 rather than spreading anything out. A control
+        // the overlay painted amber for being past what was measured has no business being the
+        // default. Still settable as DepthNormalise in the ini.
+        std::atomic<bool> depthNormalise;
+        // Per-pass profiles, the same idea as the reference fork's "Per pass" tree: what each run of
+        // the network over this frame is told, where it should differ from the values above.
+        //
+        // A later pass is looking at a picture the first pass already edited, so asking it for the
+        // same amount again is asking it to sharpen its own sharpening -- which is the other half of
+        // why a high count looks wrong. Turning structure and tone down as the chain goes on is the
+        // control for that, and it is the one thing the composition cannot do from outside.
+        //
+        // All off by default, so an install that never opens the tree behaves exactly as before.
+        std::atomic<bool> passOverride[kMaxPasses] {};
+        std::atomic<float> passStructure[kMaxPasses] {};
+        std::atomic<float> passTone[kMaxPasses] {};
+        std::atomic<float> passSkin[kMaxPasses] {};
+        std::atomic<bool> useFeedEffect { true };
+        // mochizuki's network (mochizuki.inc, MzFrameFlags): the 310.8 model instead of 310.9's, int4 mixed, and
+        // ACO's machine code, which int4 needs. Off the bridge's wire, like FeedEffect.
+        std::atomic<bool> mzOriginalModel { false }, mzInt4 { false }, mzAco { true };
+        // OpenGL only, and read-only from the ini like the rest of that family. The route hands over
+        // between the two APIs with the imported D3D12 fences when the driver has them; setting this
+        // to 0 puts it back on the CPU stall the other routes use, which is the only way to compare
+        // the two on one machine and the first thing to try if a GL host misbehaves.
+        std::atomic<bool> glSemaphores { true };
+        std::atomic<int> fenceWaitCapMs { 10000 };  // ini-only as well: see WaitFence
+        std::atomic<int> watchdogStandDown { 8 };   // ini-only as well: see NoteWatchdog
+        std::atomic<int> stallStandDownMs { 2000 }; // ini-only as well: see JobGate
+        std::atomic<bool> d3d12Wait { true };        // ini-only as well: see WaitForPreviousJob
+    } settings;
+    UINT loadedPasses = 0;
+
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> queue;
+
+    // The bridge. On D3D11 the game's device cannot run the network, so we make our own D3D12
+    // device on the same physical adapter and the two talk through shared textures and fences.
+    // Vulkan and OpenGL cross the same way: this is what a transport other than native D3D12 owns.
+    struct BridgeState
+    {
+        ComPtr<ID3D11Device5> game11;
+        ComPtr<ID3D11DeviceContext4> game11ctx;
+        ComPtr<ID3D12Device> workDevice;
+        ComPtr<ID3D12CommandQueue> workQueue;
+        bool failed = false, logged = false;
+        Bridge in { "colour-in" }, out { "result-out" };
+        ComPtr<ID3D12Resource> crossLocal;
+        // Private, unshared, on the game's device. The back buffer is copied to and from these,
+        // and only these are copied to and from the cross-device shared textures. Copying the
+        // back buffer straight into a resource shared with another device enrolls it in a
+        // kernel-level sharing dependency, and DXGI will not resize a swapchain whose buffers are
+        // still enrolled in one. Two extra full-res copies a frame is a fraction of a
+        // millisecond; the resize is not negotiable.
+        ComPtr<ID3D11Texture2D> stageIn11, stageOut11;
+        UINT stageW = 0, stageH = 0;
+        DXGI_FORMAT stageFmt = DXGI_FORMAT_UNKNOWN;
+        ComPtr<ID3D12Fence> crossFence, backFence;
+        HANDLE crossHandle = nullptr, backHandle = nullptr;
+        ComPtr<ID3D11Fence> crossOn11, backOn11;
+        UINT64 crossValue = 0, backValue = 0;
+        UINT retries = 0;  // a failure is usually a rebuild caught mid-flight: it costs a rebuild
+        // Safety net: presents seen since the bridge last finished a frame.
+        uint64_t presentsSinceFrame = 0;
+        uint64_t lastSeenFrame = 0;
+    } bridge;
+    static constexpr UINT kRing = 3;
+    ComPtr<ID3D12CommandAllocator> alloc[kRing];
+    ComPtr<ID3D12GraphicsCommandList> list[kRing];
+    ComPtr<ID3D12Fence> ringFence;
+    UINT64 ringValue[kRing] {}, ringSerial = 0;
+    HANDLE ringEvent = nullptr;
+    // A separate handle on purpose. These are auto-reset events, and two fences with a
+    // SetEventOnCompletion registration on the same handle steal each other's signal: the
+    // waiter that loses then sits out its full timeout, every frame. That is a stall a few
+    // frames in, once the ring starts interleaving with the completion wait.
+    HANDLE completionEvent = nullptr;
+    bool loggedRound = false;
+
+    bool loggedDeviceLost = false;
+    bool loggedNoBackBuffer = false;
+    static constexpr UINT kMaxBridgeRetries = 10;
+    // Share the runtime and weights. Serial passes submit and finish both the GPU
+    // list and HIP job before changing tuning globals for the following pass.
+    HMODULE runtime = nullptr;
+    // One runtime module per pass, runtimes[0] == runtime. The runtime keeps its temporal state
+    // -- history reprojection, auto exposure, the post-network history it blends -- in module
+    // globals and in one HIP engine object, so two passes through one module hand each pass
+    // the other stage's previous frame as "last frame": measured as lighting noise that history
+    // removes at one pass and stops removing at two. The reference (OptiScaler) holds one NGX
+    // feature per pass for the same reason. A copy of the DLL under another file name is a
+    // separate module with separate globals, which is all a second feature is here.
+    HMODULE runtimes[kMaxPasses] {};
+    // Bit i set when runtimes[i] recorded onto the list about to be submitted; NotifyRuntimes
+    // tells exactly those modules and clears it.
+    UINT recordedMask = 0;
+    std::filesystem::path runtimeFile;  // the file runtime was loaded from; the copies come from it
+    UINT lastJob = 0;
+    UINT activePasses = 0;
+    // Frames in a row whose first pass the engine turned down (HeldOver).
+    UINT refusedRun = 0;
+    // Log recording and parameter handoff once per process.
+    bool loggedPassDetail = false;
+    HipSetFn hipSet = nullptr;
+    int hipDevice = -1;
+    char adapterName[128] {};  // DXGI's description of the work device's adapter; InitHip's fallback
+    bool engineReady = false;
+
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> copyPipeline, depthPipeline, composePipeline, residualPipeline;
+    ComPtr<ID3D12PipelineState> lumaPipeline, flowPipeline, flowUpPipeline;
+    ComPtr<ID3D12DescriptorHeap> heap;
+
+    UINT outWidth = 0, outHeight = 0, netWidth = 0, netHeight = 0;
+    DXGI_FORMAT outFormat = DXGI_FORMAT_UNKNOWN;
+
+    ComPtr<ID3D12Resource> netColour;
+    ComPtr<ID3D12Resource> netBase;
+    ComPtr<ID3D12Resource> netResidual;
+    ComPtr<ID3D12Resource> netMotion;
+    std::vector<ComPtr<ID3D12Resource>> parked; // what a stuck job may hold, past a resize
+    ComPtr<ID3D12Resource> lumaA, lumaB, flowSmall, flowCoarse;
+    // One history per pass, not one for the chain. A pass's history has to be the output of
+    // *that* pass on the previous frame: the denoiser blends its input against the reprojected
+    // history, and pass 2's input is pass 1's output, which is a different image from the one
+    // the chain ended on. Handing every pass the chain's final output means pass 1 and pass 2
+    // are both given a reference that matches neither of their inputs, the temporal term never
+    // agrees with the spatial one, and the accumulation does not converge -- measured in game
+    // as lighting noise that history removes at one pass and stops removing at two.
+    //
+    // The reference fork reaches the same arrangement from the other end: each of its passes
+    // holds its own NGX feature, and an NGX feature carries its own history.
+    ComPtr<ID3D12Resource> history[kMaxPasses];
+    // Bit i is set when history[i] holds pass i's output from the previous frame. A bitmask
+    // rather than a flag because the passes fill in one at a time: on the first frame of a
+    // three-pass chain, pass 1 has a history and passes 2 and 3 do not, and handing a pass a
+    // texture that was never written is the stale-reference problem this whole comment is about.
+    //
+    // Cleared by the overlay's History checkbox and read and set by present. The overlay only
+    // takes g.lock for its Status section at the bottom, and the checkbox is above that, so the
+    // two threads share no lock here. Atomic, like the switches beside it.
+    std::atomic<uint32_t> historyValid { 0 };
+    bool loggedHistory = false;
+    bool loggedEffectsFirst = false;
+    UINT flowWidth = 0, flowHeight = 0;
+    UINT64 flowRuns = 0;  // estimator runs on the current lumaA/lumaB
+    bool loggedFlow = false;
+    // Separate from loggedFlow on purpose. The estimator logs on the first frame, long before a
+    // game reaches a scene that binds a velocity buffer, and a single shared flag would mean the
+    // switch to the game's own vectors -- the thing worth knowing -- never printed.
+    bool loggedGameMotion = false;
+    ComPtr<ID3D12Resource> flowReadLuma, flowReadFlow;
+    bool pendingFlow = false;
+    bool flowProbed = false;
+    // Reads back what the engine is actually handed for depth and motion. A debug view cannot
+    // answer this: "Depth x500" was scaled for the PS2, whose depth peaks near 0.002, so on an
+    // engine with a normal 0..1 range it saturates to white and a correct buffer looks like
+    // nothing at all. Numbers do not have that problem.
+    ComPtr<ID3D12Resource> guideReadDepth, guideReadMotion;
+    bool pendingGuides = false, probedDepth = false;  // and whether that frame fed depth
+    std::atomic<bool> probeGuides { true };
+    // 120, not 600: the probe is what measures the depth range, and the depth range is what the
+    // guide is scaled by. The automatic `measure, residual` fires at 240, so a probe at 600 meant
+    // the one measurement of what the network did was always taken before the guide was right.
+    // The JUNK and FLAT guards are what make an early look safe; if the guides are not real yet
+    // it re-arms and tries again.
+    uint64_t nextGuideProbe = 120;
+    // Last numbers the probe saw, for the overlay. A menu has no depth and nothing moving, so a
+    // flat reading there means nothing -- these only become meaningful in a real scene, which is
+    // why the probe keeps re-arming until it sees one.
+    std::atomic<float> probeDepthMin { 0.0f }, probeDepthMax { 0.0f };
+    std::atomic<float> probeMotionMean { 0.0f }, probeMotionMax { 0.0f };
+    std::atomic<int> probeStillPct { -1 };
+    std::atomic<bool> guidesLookReal { false }, depthUsable { true }, depthVaried { false };  // probes.inc
+    // Depth debug view scale. The PS2 peaks near 0.002 so it needed x500; a modern engine fills
+    // 0..1 and x500 is pure white, which reads as "the view is broken". The probe sets this from
+    // the range it actually measured, so one view works on both.
+    std::atomic<float> depthDebugScale { 500.0f };
+    std::atomic<float> depthScale { 1.0f };
+    ComPtr<ID3D12Resource> netDepth, depthSnapshot;
+    ID3D12Resource *snapshotOf = nullptr;  // the depthBest it holds, taken at snapshotAt; else null
+    UINT64 depthClears = 0, snapshotAt = 0;
+    bool SnapshotFresh() const { return snapshotOf != nullptr && status.frame - snapshotAt <= 2; }
+    bool loggedSnapshot = false;
+
+    // The D3D11 guide path. Depth and motion straight from the game, for engines that render
+    // them -- as opposed to the D3D12 pre-clear snapshot above, which is what PCSX2 needed.
+    Guide guideDepth { "depth" };
+    Guide guideMotion { "motion" };
+    ComPtr<ID3D11ComputeShader> guideDepthCs;
+    bool guideDepthCsFailed = false;
+    // The companion effect, effects/AMD_Neural_Feed.fx, when the user has installed it. It
+    // hands over a real optical-flow field -- iMMERSE Launchpad runs an eight-level pyramid,
+    // against the two levels and radius of four this add-on can afford next to the network --
+    // and ReShade's own depth buffer, which is curated per game in a way the bind observation
+    // here cannot be. Both are only read at present, after ReShade has finished writing them.
+    reshade::api::effect_runtime *effects = nullptr;
+    // True between reshade_begin_effects and reshade_finish_effects: the window in which the
+    // render targets being bound belong to ReShade's shaders and not to the game.
+    std::atomic<bool> inEffects { false };
+    char feedStatus[192] = "";
+    int feedSignature = -1;
+    unsigned feedZeroProbes = 0, feedZeroLatches = 0;  // the effect's field read all zero: probes.inc
+    unsigned gameZeroProbes = 0;  // and the game's own: probes.inc
+    bool feedMotionZero = false;
+    UINT64 feedRetryAt = 0;  // when AdoptFeedEffect hands motion back to the effect to look again
+    // Diagnostic. Runs the entire bridge but never touches the swapchain image, which is the
+    // only way to tell a back-buffer reference apart from anything else the add-on does to the
+    // device. Picture is untouched with this on; it is not a usable mode.
+    std::atomic<bool> noBackBuffer { false };
+    // Diagnostic. Loads and observes but never stands the bridge up: no second D3D12 device, no
+    // runtime, no shared textures. Does nothing to the picture; it exists to tell "the add-on
+    // being attached at all" apart from "what the bridge does to the game's device".
+    std::atomic<bool> noBridge { false };
+    // Diagnostic ladder for the D3D11 path: 1 stops after d3d12.dll is loaded, 2 stops after our
+    // D3D12 device is created, 3 (the default) is the whole bridge. Tells "the library arriving"
+    // apart from "a second device existing" apart from "the bridge running".
+    std::atomic<int> stage { 3 };
+    // ReShade events to subscribe to, as a bitmask: 1 bind-render-targets, 2 draw and draw-indexed,
+    // 4 clear-depth-stencil, 16 the overlay; 8 is ignored, destroy-swapchain is the resize drain
+    // and always on. Subscribing turns on ReShade's tracking for it, so this bisects the cost.
+    int events = 31;
+    // Which swapchain is mid-teardown, if any. ResizeBuffers runs on its own thread -- measured,
+    // thread 35300 while the render thread was elsewhere -- so without a gate the render thread
+    // can enter present and take hold of the back buffer again between the teardown and the
+    // actual resize, and DXGI then refuses the resize.
+    //
+    // It holds the swapchain rather than a flag because a game can have more than one alive:
+    // PCSX2 destroys and creates them (destroy_swapchain arrives with resize=false), and the
+    // init of the new one can land before the destroy of the old. A single flag then latched on
+    // for good and the add-on stopped presenting entirely -- stuck at "5 processed", with the
+    // game still rendering. Keyed on identity, a stale teardown can only ever gate its own.
+    std::atomic<void *> goneSwapchain { nullptr };
+    // The one swapchain the pipeline runs for (PrimaryRoute). Atomic because a teardown reads it
+    // before the lock, to leave goneSwapchain alone for another window's swapchain. The one a
+    // destroy let go is remembered, because its init can bring it back (lifecycle.inc).
+    std::atomic<void *> primarySwapchain { nullptr };
+    void *releasedPrimary = nullptr;
+    bool gameMotionActive = false, gameDepthActive = false;
+
+    UINT depthWidth = 0, depthHeight = 0;
+    DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
+    UINT depthBinds = 0, depthBestBinds = 0;
+    // Holds a reference of its own. This is a resource the GAME owns: a level load, a resize or
+    // a device reset frees it, and a bare pointer then points into freed memory while the depth
+    // path is still calling GetDesc, two barriers and a CopyResource against it on a later frame.
+    ComPtr<ID3D12Resource> depthBest;
+    bool loggedDepth = false;
+    ComPtr<ID3D12Resource> composed;
+    ComPtr<ID3D12Resource> readbackBase, readbackNr;
+    bool measured = false;
+    // Set by the residual measurement when the network handed back its input: the effect is
+    // running and changing nothing. Shown in red on the status line and re-checked every 1800
+    // frames, because this has happened more than once, for more than one reason, and every
+    // time it was found by eye instead of by the add-on.
+    std::atomic<bool> inert { false };
+    bool pendingMeasure = false;
+
+    UINT64 lastJobAt = 0;
+    // A job that is running right now, and how the network's real cost is kept. A dispatch that
+    // takes seconds is not slow, it is a display-driver reset waiting to happen -- see
+    // NoteJobCost. scaleCap is 0 when the person's own Scale is being honoured in full.
+    bool jobRunning = false;
+    std::atomic<float> scaleCap { 0.0f };
+    // How long the job that last stood the network down was held, in ms; 0 once it runs again.
+    std::atomic<uint32_t> standDownMs { 0 };
+    std::atomic<UINT64> worstJobMs { 0 };
+    UINT longJobs = 0;
+    UINT junkProbes = 0, flatProbes = 0;
+    ComPtr<ID3D12Fence> fence;
+    UINT64 serial = 0, completion = 0;
+
+    bool loggedProfile = false;
+    bool loggedPin = false;
+    float pinnedScale = -1.0f;
+    RasterPin rasterPin;
+    UINT measureTries = 0;
+    // Raised on the bind event, which arrives on whatever thread is recording, and read from
+    // present and the overlay. The increment sits outside g.lock on purpose -- observation must
+    // not be gated on the Depth switch -- so the counter itself has to carry the guarantee.
+    std::atomic<UINT64> depthEvents { 0 };
+};
+
+// ponytail: never destroyed, like every global holding COM objects: a destructor would release
+// them under the loader lock, after the runtime, HIP and the driver detached. Ceiling: an unload
+// keeps its refs on the game's device and context, which only a re-arm on destroy_device drops.
+State &g = *new State;
+
+#include "../temporal/history.inc"
+
+// Whether this frame's composition carries something the network produced for THIS frame.
+//
+// Compose runs on every present, including the ones where the network was skipped because its
+// previous evaluation was still on the GPU. On those frames the residual it reads belongs to an
+// older picture, and pasting it onto a frame that has already moved is not a correction -- it is
+// a ghost of where the edges used to be. A slow scene hides it completely, which is why no test
+// before GTA V ever saw it: NFS skipped 1 frame in 1205. GTA V skipped 13,921 of 37,584 -- 37%,
+// because the network costs 29 ms and the game presents faster than that -- and at speed those
+// frames read as a heavy trail behind everything.
+//
+// The measurement that says dropping it is the right answer rather than a trade: the correction's
+// own mean in that scene is 0.003. Leaving it out of a frame is below anyone's threshold;
+// putting it in the wrong place is not.
+
+bool RuntimeInline();  // runtimes.inc
+
+// Async, an engine still on its last job turns the next one down, and on a slow card it does so every other frame.
+// The residual it holds is that last job's, as late as async already composes it, so a frame or two keeps it rather
+// than strobing between NR and the game's own picture. Same frame, a refusal means something else: it stays out.
+bool HeldOver()
+{
+    return !RuntimeInline() && g.refusedRun > 0 && g.refusedRun <= 2;
+}
+
+bool CompositionIsFresh(bool ranNetwork)
+{
+    // A debug view draws a buffer, not a correction, so it has nothing that can go stale -- and
+    // gating it here would make the views themselves strobe, which is the opposite of readable.
+    //
+    // Network Output is ungated for the same reason and a second one: what it shows on a skipped
+    // frame is the previous *whole* picture, which reads as a held frame. That is a different
+    // artefact from a correction aimed at where the edges used to be, and on D3D12 it is the one
+    // that was preferred. Gating it would replace the held frame with the game's own image and
+    // make the mode flicker between two different pictures, which is worse than either.
+    if (g.settings.debugView.load() != 0 || g.settings.networkOutput.load())
+        return true;
+    return ranNetwork && (g.activePasses != 0 || HeldOver());
+}
+
+int RuntimeTonemap()
+{
+    const int requested = g.settings.tonemap.load();
+    // Encoding=0 is the UI's sRGB passthrough. The copy shader stores these SDR
+    // code values in FP16; that storage format does not turn them into HDR.
+    // Other encodings keep the runtime's auto behaviour. Explicit overrides
+    // remain available, including 1 to reproduce the old SDR auto result.
+    return requested == -1 && g.settings.encoding.load() == 0 ? 0 : requested;
+}
+
+// Settings live in an ini next to the exe. Two reasons, both practical: nothing in the overlay
+// survived a restart, so every A/B test meant re-dialling half a dozen sliders by hand; and a
+// headless run had no way to reach them at all, which made a parameter sweep impossible to
+// automate. GetPrivateProfile* is the Win32 ini reader -- no parser to write or get wrong.
+// A settings file nobody can read is a settings file nobody edits. The overlay writes this one
+// back through WritePrivateProfileString, which cannot carry a comment, so an install that had
+// only ever been saved from the overlay ended up as a bare list of keys -- and the two questions
+// people actually have, "can it come on by itself" and "can I change the key", had no visible
+// answer in it at all.
+//
+// Written only when the file is absent, so a personal tuning is never overwritten. The values
+// here are the same defaults the code carries; this file existing changes nothing about how the
+// add-on behaves.
+void LoadSettings();
+void SaveSettings(bool quiet = false);
+
+#include "ini_migrate.inc"
+
+// Returns whether it read the settings itself, which it does only on the run that writes the file.
+// The caller uses that to skip a second read: on a first run this used to parse the ini twice and
+// print the same two "settings:" and "compose:" lines twice, describing one state.
+bool EnsureNeuralIni()
+{
+    MigrateLegacyIni();
+    const auto ini = ExeDirectory() / L"amd-nr.ini";
+    std::error_code ec;
+    if (std::filesystem::exists(ini, ec))
+    {
+        MigrateTemporalDefault(ini);
+        return false;
+    }
+
+    std::ofstream f(ini, std::ios::binary);
+    if (!f)
+    {
+        Log("could not write %ls; the built-in defaults are used instead.", ini.c_str());
+        return false;
+    }
+    f << "[amd-nr]\r\n"
+         "; Written because no amd-nr.ini was here. Every value below is the default, so\r\n"
+         "; this file changes nothing until you edit it. The overlay writes back here on its own,\r\n"
+         "; as soon as a control settles; the Save button does the same thing on demand.\r\n"
+         "\r\n"
+         "; --- starting up -------------------------------------------------------------\r\n"
+         "; 1 = the effect is already on when the game opens. 0 = the game shows its own\r\n"
+         "; image until you press the hotkey. Set this to 1 for a game that is a chore to\r\n"
+         "; get back into; you will not have to press anything again.\r\n"
+         "StartOn=0\r\n"
+         "\r\n"
+         "; --- the hotkey --------------------------------------------------------------\r\n"
+         "; ToggleKey is a Windows virtual-key code; 0x23 (35) is End. ToggleMods adds up\r\n"
+         "; 1 Ctrl + 2 Alt + 4 Shift, so 1 is Ctrl and 0 is no modifier at all. Together\r\n"
+         "; these default to Ctrl+End. Easier than looking codes up: open the overlay,\r\n"
+         "; click the key button and press the combination you want; it is kept on its own.\r\n"
+         "ToggleKey=35\r\n"
+         "ToggleMods=1\r\n"
+         "\r\n"
+         "; 1 = alt-tabbing out switches the effect OFF, and it stays off when you come\r\n"
+         "; back -- you turn it on again with the hotkey. 0 = alt-tab changes nothing.\r\n"
+         "; Either way, a minimised window is always sat out and always resumes on its own.\r\n"
+         "DisableOnAltTab=0\r\n"
+         "\r\n"
+         "; --- the picture -------------------------------------------------------------\r\n"
+         "; Scale is the resolution the network runs at, as a fraction of the screen. Lower\r\n"
+         "; is faster and the network answers differently, not just softer. Passes is how\r\n"
+         "; many times it runs over the frame; 1 is the default and 2 is already heavy.\r\n"
+         "Scale=1.0\r\n"
+         "Passes=1\r\n"
+         "; 0 sRGB (use this for an ordinary SDR game), 1 Linear, 2 scRGB-nl.\r\n"
+         "Encoding=0\r\n"
+         "; 0 English, 1 Portugues do Brasil.\r\n"
+         "Language=0\r\n"
+         "\r\n"
+         "; --- everything else ---------------------------------------------------------\r\n"
+         "; Everything else the overlay carries follows, each at its default, so this file on\r\n"
+         "; its own is enough to tune the add-on with the overlay never opened -- which is what\r\n"
+         "; a game running under Lossless Scaling or Magpie needs, because there the overlay\r\n"
+         "; sits behind somebody else's picture -- and because the overlay deliberately shows\r\n"
+         "; only the controls worth reaching for. Everything else lives here and nowhere\r\n"
+         "; else: the engine's option struct, the guide switches, the per-pass profiles, the\r\n"
+         "; composition bounds. Press Reload in the overlay to pick an edit up without\r\n"
+         "; restarting the game.\r\n"
+         "; Intensity leads because it is the one people reach for: the weight of the whole\r\n"
+         "; effect, 1 being the network at full strength.\r\n"
+         "Intensity=1\r\n"
+         "\r\n"
+         "; --- Style ---------------------------------------------------------------------\r\n"
+         "; danielblnc's Style, the look the network is asked for: 0 = Default, 1 = Natural,\r\n"
+         "; 2 = Cinematic, the same three DLSSNR.Style selects on NVIDIA. It goes to the\r\n"
+         "; network itself, as in his own overlay. Changing it drops the temporal history.\r\n"
+         "Style=0\r\n";
+    f.close();
+
+    // The rest of the keys, through the same writer the overlay's Save uses, so a file written
+    // here and a file written by Save carry exactly the same set -- an edit made without the
+    // overlay cannot need a key that only exists once somebody has pressed a button.
+    //
+    // LoadSettings first: every key the header above leaves out reads as its default in the
+    // settings table, the same value g is constructed with, and DllMain skips its own read on the
+    // run that writes the file.
+    LoadSettings();
+    SaveSettings(/*quiet=*/true);
+    Log("wrote a commented amd-nr.ini next to the exe; every value in it is a default.");
+    return true;
+}
+
+// One value from the settings table's point of view (settings_fields.inc): what is not a finite
+// number is the row's default, a flag is anything but zero, and the rest clamps to the row's range
+// -- the one the panel and the 32-bit bridge's wire clamp to as well.
+template <class T>
+T SettingValue(double v, double def, double low, double high)
+{
+    if (!std::isfinite(v))
+        v = def;
+    if constexpr (std::is_same_v<T, bool>)
+        v = v != 0.0 ? 1.0 : 0.0;
+    return static_cast<T>(std::clamp(v, low, high));
+}
+
+void LoadSettings()
+{
+    const auto ini = (ExeDirectory() / L"amd-nr.ini").wstring();
+    if (ini_text::StripUtf8Bom(ini))
+        Log("removed a UTF-8 byte-order mark from amd-nr.ini: it was hiding every setting "
+            "in the file, and all of them were reading as their defaults.");
+    auto numd = [&](const wchar_t *key, double fallback) {
+        wchar_t buf[64] {};
+        if (GetPrivateProfileStringW(L"amd-nr", key, L"", buf, 64, ini.c_str()) == 0)
+            return fallback;
+        // wcstod honours the process locale's decimal separator. On a pt-BR install that is a
+        // comma, so "0.50" parses as 0 and stops at the dot -- Scale=0.50 silently became the
+        // clamp floor of 0.25. The file is ours and always writes a dot, so parse it in the C
+        // locale regardless of what the user's machine is set to.
+        static _locale_t c_locale = _create_locale(LC_NUMERIC, "C");
+        wchar_t *end = nullptr;
+        const double v = c_locale != nullptr ? _wcstod_l(buf, &end, c_locale) : std::wcstod(buf, &end);
+        return end == buf || !std::isfinite(v) ? fallback : v;  // nan and inf are no value either
+    };
+    auto num = [&](const wchar_t *key, float fallback) { return static_cast<float>(numd(key, fallback)); };
+    auto flag = [&](const wchar_t *key, bool fallback) {
+        return num(key, fallback ? 1.0f : 0.0f) != 0.0f;
+    };
+
+    // Every row of the table with a key. One that is absent reads as its default, not as the value
+    // before a reload, so the file alone says what runs.
+#define X(type, name, key, def, low, high)                                                         \
+    if (*key)                                                                                      \
+        g.settings.name.store(SettingValue<decltype(g.settings.name.load())>(numd(L"" key, def), def, low, high));
+#include "../x86bridge/settings_fields.inc"
+#undef X
+    // Advanced=1 was the single switch this replaced; honour it once as "show all of them".
+    // kOptAll lives beside enum Opt, so a new bit widens both the mask and this in one edit. Read as
+    // an integer: 26 bits do not survive float. Masked, so a bit a newer build saved is dropped.
+    g.settings.optional.store(static_cast<uint32_t>(GetPrivateProfileIntW(L"amd-nr", L"HiddenShown",
+        static_cast<INT>(flag(L"Advanced", false) ? kOptAll : g.settings.optional.load()), ini.c_str())) & kOptAll);
+    // Per-pass profiles. Seeded from the globals so a pass whose override is switched on for the
+    // first time starts where the chain already was, rather than at zero.
+    for (UINT i = 0; i < State::kMaxPasses; ++i)
+    {
+        wchar_t key[32];
+        swprintf_s(key, L"Pass%uOverride", i + 1);
+        g.settings.passOverride[i].store(flag(key, false));
+        swprintf_s(key, L"Pass%uStructure", i + 1);
+        g.settings.passStructure[i].store(num(key, g.settings.structure.load()));
+        swprintf_s(key, L"Pass%uTone", i + 1);
+        g.settings.passTone[i].store(num(key, g.settings.tone.load()));
+        swprintf_s(key, L"Pass%uSkin", i + 1);
+        g.settings.passSkin[i].store(num(key, g.settings.skin.load()));
+    }
+    if (!g.settings.inlineMode.load())
+        Log("Inline=0: the engine runs async, so the game's queue does not wait for the network");
+    g.settings.useFeedEffect.store(flag(L"FeedEffect", g.settings.useFeedEffect.load()));
+    g.settings.mzOriginalModel.store(flag(L"MochizukiOriginalModel", g.settings.mzOriginalModel.load()));
+    g.settings.mzInt4.store(flag(L"MochizukiInt4", g.settings.mzInt4.load()));
+    g.settings.mzAco.store(flag(L"MochizukiAco", g.settings.mzAco.load()));
+    g.noBackBuffer.store(flag(L"NoBackBuffer", g.noBackBuffer.load()));
+    g.noBridge.store(flag(L"NoBridge", g.noBridge.load()));
+    g.settings.glSemaphores.store(flag(L"GlSemaphores", g.settings.glSemaphores.load()));
+    const int capMs = static_cast<int>(num(L"FenceWaitCapMs", 10000.0f));  // under 1 s, one slow frame stands it down
+    g.settings.fenceWaitCapMs.store(capMs <= 0 ? 0 : std::max(capMs, 1000));
+    g.settings.watchdogStandDown.store(std::max(0, static_cast<int>(num(L"WatchdogStandDown", 8.0f))));
+    g.settings.stallStandDownMs.store(std::max(0, static_cast<int>(num(L"StallStandDownMs", 2000.0f))));
+    g.settings.d3d12Wait.store(flag(L"D3D12Wait", true));
+    if (!g.settings.d3d12Wait.load())
+        Log("D3D12Wait=0: no present waits for the last evaluation, so expect more frames skipped as pending.");
+    g.stage.store(static_cast<int>(num(L"Stage", 3.0f)));
+    g.events = static_cast<int>(num(L"Events", 31.0f));
+    // Enabled starts as StartOn says. StartOn began as a diagnostic in the family of Stage / Events /
+    // NoBridge: the add-on starts switched off on purpose and the switch is a keypress, so a route
+    // could only be exercised by a person at the machine -- and the Vulkan route is the one that has
+    // to be booted, watched and shut down without one. It is a normal setting now, in the overlay.
+    g.settings.enabled.store(g.settings.startOn.load());
+    if (g.settings.startOn.load())
+        Log("StartOn=1: the effect is on from the first frame. Set it to 0, or clear the box in "
+            "the overlay, to go back to starting with the game's own image.");
+    // Optical flow is built into the 64-bit add-on (build.ps1 -Ffx) and on there by default; the 32-bit
+    // bridge's host has none, where OpticalFlow=2 would pass over the game's vectors for nothing.
+    const int opticalFlow = std::clamp(static_cast<int>(num(L"OpticalFlow", AMDNR_WITH_FFX ? 1.0f : 0.0f)), 0, 2);
+    if (opticalFlow != 0 && !AMDNR_WITH_FFX)
+        Log("OpticalFlow=%d needs a build with FidelityFX; this one reads it as 0, so the game's own "
+            "vectors are still used when it has them.", opticalFlow);
+    g.settings.opticalFlow.store(AMDNR_WITH_FFX ? opticalFlow : 0);
+    g.settings.motionMaxPx.store(std::max(0.0f, num(L"MotionMaxPx", 0.0f)));
+    g.settings.historyGuard.store(std::clamp(static_cast<int>(num(L"HistoryGuard", 0.0f)), 0, 1));
+    // The post kernel's output scale; at zero the network's answer never reaches the frame, which
+    // reads as "enabled and disabled look the same" with the log saying every frame was processed.
+    // Refused here rather than allowed, because nothing distinguishes a run with it at zero from a
+    // run where the network broke, and Intensity 0 already exists for "show me the game's own
+    // frame". 0.03125 is the runtime's own default and the table's.
+    if (const float es = g.settings.engineScale.load(); !(es >= 1e-4f))
+    {
+        Log("WARNING: EngineScale=%.6f would make the network's output identical to its "
+            "input; using the runtime's default 0.03125 instead.", static_cast<double>(es));
+        g.settings.engineScale.store(0.03125f);
+    }
+    g.settings.diagnostics = static_cast<int>(num(L"Diagnostics", 0.0f));
+
+    Log("settings: scale %.2f passes %d intensity %.2f structure %.2f skin %.2f tone %.2f bicubic %d motion %d "
+        "history %d gate %.3f ratio %.2f debug %d temporal %d seed %d smooth %.2f/%.0f lab flow %d maxpx %.0f guard %d",
+        static_cast<double>(g.settings.scale.load()), g.settings.passes.load(),
+        static_cast<double>(g.settings.intensity.load()), static_cast<double>(g.settings.structure.load()),
+        static_cast<double>(g.settings.skin.load()), static_cast<double>(g.settings.tone.load()), g.settings.bicubic.load() ? 1 : 0,
+        g.settings.useMotion.load() ? 1 : 0, g.settings.useHistory.load() ? 1 : 0, static_cast<double>(g.settings.flowGate.load()),
+        static_cast<double>(g.settings.flowRatio.load()), g.settings.debugView.load(), g.settings.temporalMode.load(),
+        g.settings.fixedSeed.load(), static_cast<double>(g.settings.outputSmooth.load()), static_cast<double>(g.settings.outputSmoothLimit.load()),
+        g.settings.opticalFlow.load(), static_cast<double>(g.settings.motionMaxPx.load()), g.settings.historyGuard.load());
+    Log("compose: %s, guard %.2f%s, colour strength %.2f, residual limit %.3f, edge fade %.3f, "
+        "later passes %s",
+        g.settings.ratioGuard.load() > 0.0f ? "ratio" : "additive",
+        static_cast<double>(g.settings.ratioGuard.load()),
+        g.settings.guardTracksPasses.load() ? " (+1 per extra pass)" : "",
+        static_cast<double>(g.settings.colourStrength.load()),
+        static_cast<double>(g.settings.residualLimit.load()),
+        static_cast<double>(g.settings.residualFade.load()),
+        g.settings.passTaper.load() ? "tapered by half each" : "at full strength");
+    for (UINT i = 0; i < State::kMaxPasses; ++i)
+        if (g.settings.passOverride[i].load())
+            Log("  pass %u profile: structure %.2f tone %.2f skin %.2f", i + 1,
+                static_cast<double>(g.settings.passStructure[i].load()),
+                static_cast<double>(g.settings.passTone[i].load()),
+                static_cast<double>(g.settings.passSkin[i].load()));
+    // Any key may have moved, OpticalFlow too, which neither the panel nor the wire carries.
+    ResetTemporal("the settings were read from amd-nr.ini");
+}
+
+// The other half of LoadSettings, which was missing: everything the overlay changed was lost on
+// exit, so an A/B test meant editing the ini by hand between runs. WritePrivateProfileStringW is
+// the matching Win32 writer, and the numbers are formatted in the C locale for the same reason
+// the reader parses in it -- a pt-BR install would otherwise write "0,50", which the reader then
+// stops at the comma.
+// Every key that belongs in the ini, listed once: the settings table's rows with a key, then the
+// per-pass profiles and FeedEffect. SaveSettings writes them and the overlay's autosave hashes them;
+// two lists would drift, and a setting present in one but not the other is a control that quietly
+// stops being saved -- which is the bug this whole pair exists to prevent.
+template <class Num, class Flag>
+void ForEachSetting(Num num, Flag flag)
+{
+#define X(type, name, key, def, low, high) if (*key) num(L"" key, static_cast<double>(g.settings.name.load()));
+#include "../x86bridge/settings_fields.inc"
+#undef X
+    for (UINT i = 0; i < State::kMaxPasses; ++i)
+    {
+        wchar_t key[32];
+        swprintf_s(key, L"Pass%uOverride", i + 1);
+        flag(key, g.settings.passOverride[i].load());
+        swprintf_s(key, L"Pass%uStructure", i + 1);
+        num(key, g.settings.passStructure[i].load());
+        swprintf_s(key, L"Pass%uTone", i + 1);
+        num(key, g.settings.passTone[i].load());
+        swprintf_s(key, L"Pass%uSkin", i + 1);
+        num(key, g.settings.passSkin[i].load());
+    }
+    flag(L"FeedEffect", g.settings.useFeedEffect.load());
+    flag(L"MochizukiOriginalModel", g.settings.mzOriginalModel.load());
+    flag(L"MochizukiInt4", g.settings.mzInt4.load());
+    // Stage / Events / NoBridge / NoBackBuffer are deliberately not written back. They are
+    // startup diagnostics, they cannot take effect live, and rewriting them here would quietly
+    // re-save a one-off value that was meant for a single run.
+}
+
+void SaveSettings(bool quiet)
+{
+    const auto ini = (ExeDirectory() / L"amd-nr.ini").wstring();
+    ForEachSetting(
+        [&](const wchar_t *key, double v) {
+            wchar_t buf[64];
+            static _locale_t c_locale = _create_locale(LC_NUMERIC, "C");
+            // Whole numbers in full: %.4g kept four digits, and HiddenShown is a bit mask past 10^7.
+            const wchar_t *fmt = v == std::floor(v) && std::fabs(v) < 1e9 ? L"%.0f" : L"%.4g";
+            if (c_locale != nullptr)
+                _swprintf_s_l(buf, 64, fmt, c_locale, v);
+            else
+                swprintf_s(buf, 64, fmt, v);
+            WritePrivateProfileStringW(L"amd-nr", key, buf, ini.c_str());
+        },
+        [&](const wchar_t *key, bool v) {
+            WritePrivateProfileStringW(L"amd-nr", key, v ? L"1" : L"0", ini.c_str());
+        });
+    // Quiet while the first-run file is being filled in, and while autosaving: that line is the
+    // only proof anyone has that the overlay's Save reached the disk, so it keeps meaning only that.
+    if (!quiet) Log("settings saved to amd-nr.ini");
+}
+
+// "Has anything changed" without reading the ini back. FNV-1a over the same values, rounded through
+// float first so a control that never left its own precision cannot look like an edit.
+uint64_t SettingsFingerprint()
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](double v) {
+        const float f = static_cast<float>(v);
+        uint32_t bits = 0;
+        std::memcpy(&bits, &f, sizeof(bits));
+        h = (h ^ bits ^ (v == std::floor(v) ? static_cast<uint32_t>(static_cast<int64_t>(v)) : 0u)) * 1099511628211ull;
+    };
+    ForEachSetting([&](const wchar_t *, double v) { mix(v); },
+                   [&](const wchar_t *, bool v) { mix(v ? 1.0 : 0.0); });
+    return h;
+}
+
+// Our own D3D12 device on the adapter the game is already using, so shared textures and fences
+// stay on one GPU and never touch system memory. Modelled on session.cpp::Session::CreateOn,
+// which is the measured, working version of this transport.
+// The adapter comes from the game's own D3D11 device, which BridgeStep1 has already asked. That
+// is the same adapter by construction, and it means no DXGI factory has to be created -- one
+// fewer library to touch, and one fewer chance to disturb the runtime the game is using.
+bool RecreateWorkSlot(UINT slot)
+{
+    if (slot >= State::kRing || g.bridge.workDevice == nullptr)
+        return false;
+
+    // A failed Close leaves the list recording and unusable, while an allocator Reset followed by
+    // a failed list Reset leaves the pair out of step. Recreate both so a transient bad recording
+    // cannot poison this ring slot for the rest of the process.
+    g.list[slot].Reset();
+    g.alloc[slot].Reset();
+    const HRESULT allocatorHr = g.bridge.workDevice->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g.alloc[slot]));
+    const HRESULT listHr = SUCCEEDED(allocatorHr)
+                               ? g.bridge.workDevice->CreateCommandList(
+                                     0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[slot].Get(), nullptr,
+                                     IID_PPV_ARGS(&g.list[slot]))
+                               : allocatorHr;
+    const HRESULT closeHr = SUCCEEDED(listHr) ? g.list[slot]->Close() : listHr;
+    if (FAILED(allocatorHr) || FAILED(listHr) || FAILED(closeHr))
+    {
+        Log("bridge: could not recreate work slot %u (allocator 0x%08lX, list 0x%08lX, "
+            "close 0x%08lX).", slot, allocatorHr, listHr, closeHr);
+        g.list[slot].Reset();
+        g.alloc[slot].Reset();
+        return false;
+    }
+    g.ringValue[slot] = 0;
+    return true;
+}
+
+bool CreateWorkDevice(IDXGIAdapter *adapter, LUID luid)
+{
+    DXGI_ADAPTER_DESC ad {};
+    adapter->GetDesc(&ad);
+    const HRESULT hr =
+        p_D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g.bridge.workDevice));
+    if (FAILED(hr))
+    {
+        Log("bridge: D3D12CreateDevice failed 0x%08lX.", hr);
+        return false;
+    }
+    D3D12_COMMAND_QUEUE_DESC qd {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(g.bridge.workDevice->CreateCommandQueue(&qd, IID_PPV_ARGS(&g.bridge.workQueue))))
+    {
+        Log("bridge: could not create the work queue.");
+        return false;
+    }
+    for (UINT i = 0; i < State::kRing; ++i)
+    {
+        if (!RecreateWorkSlot(i))
+        {
+            Log("bridge: could not create the command allocator or list.");
+            return false;
+        }
+    }
+    if (FAILED(g.bridge.workDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.ringFence))) ||
+        FAILED(g.bridge.workDevice->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g.bridge.crossFence))) ||
+        FAILED(g.bridge.workDevice->CreateSharedHandle(g.bridge.crossFence.Get(), nullptr, GENERIC_ALL, nullptr,
+                                                &g.bridge.crossHandle)) ||
+        FAILED(g.bridge.workDevice->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g.bridge.backFence))) ||
+        FAILED(g.bridge.workDevice->CreateSharedHandle(g.bridge.backFence.Get(), nullptr, GENERIC_ALL, nullptr,
+                                                &g.bridge.backHandle)))
+    {
+        Log("bridge: could not create the shared fences.");
+        return false;
+    }
+    g.ringEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g.completionEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    char name[128] {};
+    WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+    memcpy(g.adapterName, name, sizeof(g.adapterName));
+    const LUID got = g.bridge.workDevice->GetAdapterLuid();
+    Log("bridge: own D3D12 device on %s (vendor %04X). LUID game %08lX:%08lX, ours %08lX:%08lX -> "
+        "%s adapter.", name, ad.VendorId, static_cast<unsigned long>(luid.HighPart),
+        luid.LowPart, static_cast<unsigned long>(got.HighPart), got.LowPart,
+        (got.HighPart == luid.HighPart && got.LowPart == luid.LowPart) ? "same" : "DIFFERENT");
+    return true;
+}
+
+#include "probes.inc"
+
+bool EnsureResources(UINT w, UINT h, DXGI_FORMAT outFormat, float scale);
+bool CreateTexture(UINT w, UINT h, DXGI_FORMAT f, ComPtr<ID3D12Resource> &out, const char *what,
+                   D3D12_RESOURCE_STATES initialState =
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+using SubmitPassFn = std::function<bool()>;
+bool RecordNetwork(ID3D12GraphicsCommandList *&cmd, ID3D12Resource *colourSrc,
+                   DXGI_FORMAT colourFmt, ID3D12Resource *outTarget, bool runNetwork, UINT wanted,
+                   const SubmitPassFn &submitPass = {});
+
+#include "feed_provider.inc"
+
+// One texture of the companion effect, as the D3D11 resource ReShade allocated for it.
+// ReShade owns the lifetime; this is read inside present, between the effect chain finishing
+// and the copy that carries it across, which is the window where it is both written and alive.
+bool FeedTexture(const char *name, Guide &guide)
+{
+    if (g.effects == nullptr)
+        return false;
+    const auto var = g.effects->find_texture_variable("AMD_Neural_Feed.fx", name);
+    if (var.handle == 0)
+        return false;
+    reshade::api::resource_view srv {}, srgb {};
+    g.effects->get_texture_binding(var, &srv, &srgb);
+    if (srv.handle == 0)
+        return false;
+    reshade::api::device *dev = g.effects->get_device();
+    if (dev == nullptr)
+        return false;
+    const reshade::api::resource res = dev->get_resource_from_view(srv);
+    auto *native = reinterpret_cast<ID3D11Resource *>(res.handle);
+    if (native == nullptr)
+        return false;
+    const auto desc = dev->get_resource_desc(res);
+    if (desc.texture.width < kGuideFloor || desc.texture.height < kGuideFloor)
+        return false;
+    // reshade::api::format is DXGI's numbering, value for value, which is what lets the rest of
+    // the guide path -- built against DXGI_FORMAT throughout -- take this without a translation
+    // table that would have to be kept in step with two enums at once.
+    const auto format = static_cast<DXGI_FORMAT>(desc.texture.format);
+    if (guide.chosen.Get() != native || guide.format != format ||
+        guide.width != desc.texture.width || guide.height != desc.texture.height)
+    {
+        guide.chosen = native;
+        guide.width = desc.texture.width;
+        guide.height = desc.texture.height;
+        guide.format = format;
+        guide.ready = false;
+        guide.logged = false;
+        guide.failed = false;
+        guide.challenger = nullptr;
+        guide.challengerFrames = 0;
+    }
+    guide.external = true;
+    return true;
+}
+
+// Take the companion effect's guides when it is installed and switched on, and hand the slots
+// back to the bind observation when it is not. Called once per present, before the tally is
+// settled, because the tally must not be consulted for a slot the effect owns.
+//
+// The game's own depth is preferred over the effect's: a real depth buffer is the geometry the
+// engine drew, while ReShade's is whatever its heuristic selected, and on the routes where the
+// observation finds nothing the effect is the only source there is. Motion is the other way
+// round -- the effect's field beats this add-on's own estimator on every count -- but a game
+// that writes a velocity buffer still beats both, because that one is not a guess at all.
+void AdoptFeedEffect()
+{
+    // A texture whose technique is not ticked is not being written. It still resolves, still
+    // has the right size, and still copies across without complaint -- as whatever was in it
+    // when the technique was last on, or as zeros. Both read to the network as fact.
+    const bool ticked = g.settings.useFeedEffect.load() && g.effects != nullptr &&
+                        TechniqueOn("AMD_Neural_Feed.fx", "AMD_Neural_Feed");
+    bool below = false;
+    const char *providerTech = ticked ? FeedProviderOn(below) : nullptr;
+    const bool provider = providerTech != nullptr;  // below the effect too, a frame late, and said so
+    const bool haveGameMotion = g.guideMotion.chosen != nullptr && !g.guideMotion.external;
+    const bool haveGameDepth = g.guideDepth.chosen != nullptr && !g.guideDepth.external;
+    // The probe's all-zero demotion (probes.inc) holds until one of these changes, not the outputs.
+    const int inputs = (ticked ? 1 : 0) | (haveGameMotion ? 8 : 0) | (haveGameDepth ? 16 : 0) |
+                       (provider ? 32 : 0) | (below ? 64 : 0) | (providerTech != nullptr ? 256 : 0);
+    if (g.feedSignature < 0 || (g.feedSignature & ~(2 | 4 | 128)) != inputs)
+        g.feedMotionZero = false, g.feedZeroProbes = g.feedZeroLatches = 0;
+    else if (g.feedMotionZero && g.status.frame >= g.feedRetryAt)
+    {
+        g.feedMotionZero = false, g.feedZeroProbes = 0;
+        Log("AMD_Neural_Feed.fx: taking the effect's motion again, to see whether its field still reads all zero");
+    }
+
+    bool mv = false, depth = false;
+    // Depth needs only the effect; motion needs a provider behind it as well, because the
+    // effect is a validator and a converter, not an estimator -- with nothing writing the
+    // provider's texture it forwards zeros, and zeros are worse than the estimator.
+    if (provider && !haveGameMotion && !g.feedMotionZero)
+        mv = FeedTexture("AMDNR_MV", g.guideMotion);
+    if (ticked && !haveGameDepth)
+        depth = FeedTexture("AMDNR_Depth", g.guideDepth);
+    for (Guide *guide : { &g.guideMotion, &g.guideDepth })
+    {
+        const bool taken = (guide == &g.guideMotion) ? mv : depth;
+        if (guide->external && !taken)
+        {
+            // The effect went away -- unticked, reloaded, or the game changed resolution and
+            // ReShade rebuilt its textures. Drop the slot rather than keep copying from a
+            // resource that is no longer the one being written.
+            guide->external = false;
+            guide->chosen.Reset();
+            guide->ready = false;
+            guide->failed = false;
+        }
+    }
+
+    // Says the state once per change, not once per frame. Games recreate swapchains in bursts
+    // and ReShade its effects with them, and a line per present would bury everything else.
+    const int signature = inputs | (mv ? 2 : 0) | (depth ? 4 : 0) | (g.feedMotionZero ? 128 : 0);
+    if (signature == g.feedSignature)
+        return;
+    const bool first = g.feedSignature < 0;
+    g.feedSignature = signature;
+    // Re-arm the guide probe whenever the motion source changes hands. The probe is the only
+    // instrument that says what is actually in the field, and it latched itself off after one
+    // reading -- a reading taken in the first seconds, while ReShade was still compiling, so it
+    // always measured the estimator and never the provider that replaced it. Toggling the
+    // provider's technique is exactly the A/B this is for, and it has to be measurable more
+    // than once. Not on the first call: the probe is already armed then, and re-arming would
+    // only push the reading further out.
+    if (!first)
+        RearmGuideProbe(false);  // a slot filled or emptied: a buffer replaced is SettleGuide's
+    char under[128] {};
+    std::snprintf(under, sizeof(under),
+                  "enabled, but %s is below AMD_Neural_Feed; move it above for this frame's motion",
+                  providerTech != nullptr ? providerTech : "");
+    std::snprintf(g.feedStatus, sizeof(g.feedStatus),
+                  "AMD_Neural_Feed.fx: %s; motion %s, depth %s",
+                  g.effects == nullptr      ? "no effect runtime yet"
+                  : !g.settings.useFeedEffect.load() ? "switched off"
+                  : !ticked                 ? "not installed, or its technique is not enabled"
+                  : below ? under
+                  : !provider ? "enabled, but the motion-vector shader AMDNR_MV_PROVIDER names is not enabled"
+                              : "enabled",
+                  mv               ? "from the effect"
+                  : haveGameMotion ? "from the game"
+                  : g.feedMotionZero ? "estimated (the effect's field read all zero)"
+                                   : "estimated",
+                  depth           ? "from the effect"
+                  : haveGameDepth ? "from the game"
+                                  : "none of its own");
+    // The raw answers behind the summary, because the summary was seen flapping between
+    // "enabled" and "no motion-vector shader" several times a second on a preset that had not
+    // changed. A handle of 0 is find_technique refusing while ReShade is loading; a state of 0
+    // is the technique itself switched off.
+    const auto feedTech = g.effects ? g.effects->find_technique("AMD_Neural_Feed.fx", "AMD_Neural_Feed") : reshade::api::effect_technique { 0 };
+    const auto lpTech = g.effects ? g.effects->find_technique("MartysMods_LAUNCHPAD.fx", "MartysMods_Launchpad") : reshade::api::effect_technique { 0 };
+    Log("%s  [frame %llu: feed handle %d state %d, launchpad handle %d state %d]", g.feedStatus,
+        static_cast<unsigned long long>(g.status.frame), feedTech.handle != 0 ? 1 : 0,
+        feedTech.handle != 0 && g.effects->get_technique_state(feedTech) ? 1 : 0,
+        lpTech.handle != 0 ? 1 : 0,
+        lpTech.handle != 0 && g.effects->get_technique_state(lpTech) ? 1 : 0);
+}
+
+#include "stats.inc"
+#include "scale_cap.inc"
+#include "runtimes.inc"
+
+void RenderEffectsAheadOfNetwork(device *dev, resource back);
+
+#include "runtime_files.inc"
+
+// Hand a freshly loaded module the device, the queue and the switches, then let it load the
+// weights. The same for the first module and for the per-pass copies.
+bool ArmRuntime(HMODULE h)
+{
+    At<ID3D12Device *>(h, rt::B->kDevice) = g.device.Get();
+    g.device->AddRef();
+    At<ID3D12CommandQueue *>(h, rt::B->kQueue) = g.queue.Get();
+    g.queue->AddRef();
+    At<int>(h, rt::B->kHipDevice) = g.hipDevice;
+    At<uint8_t>(h, rt::B->kInlineMode) = RuntimeInline() ? 1 : 0;
+    At<uint8_t>(h, rt::B->kInterop) = 1;
+    At<uint8_t>(h, rt::B->kEnabled) = 1;
+    At<uint8_t>(h, rt::B->kUseFsrInputs) = 1;
+    At<uint8_t>(h, rt::B->kUseDepth) = 0;
+    At<int>(h, rt::B->kTonemap) = RuntimeTonemap();
+    // Pinned over dlssnr_on_amd.ini; runtime_offsets.h says why each matters. The runtime read the
+    // file in DllMain, and its re-read every 120 presents is on the path the first patch removes.
+    // Style then follows the add-on's own setting on every job.
+    At<int>(h, rt::B->kCpuWait) = 0;
+    At<int>(h, rt::B->kStyle) = 0;
+    At<int>(h, rt::B->kToneCurve) = 0;
+    At<float>(h, rt::B->kToneLift) = 0.0f;
+
+    const std::string file = (ExeDirectory() / L"dlssnr_on_amd_weights.bin").string();
+    if (g.hipSet(g.hipDevice) != 0 ||
+        !reinterpret_cast<InitFn>(reinterpret_cast<uintptr_t>(h) + rt::B->kInitFn)(
+            reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(h) + rt::B->kEngineObject), &file))
+    {
+        Log("engine init failed.");
+        return false;
+    }
+    At<uint8_t>(h, rt::B->kReady) = 1;
+    return true;
+}
+
+// A second (third) copy of the runtime, for pass `slot` + 1. The loader keys modules by file
+// name, so a byte-identical copy under another name is a separate module: its own globals, its
+// own HIP engine object, its own weights in VRAM (about 150 MB each) and, the point of it, its
+// own temporal state. Loaded the first time a pass count needs it, with no job in flight
+// (BringUpEngines), which costs one long frame.
+bool LoadExtraRuntime(UINT slot)
+{
+    if (g.runtime == nullptr || g.runtimeFile.empty() || slot == 0 || slot >= State::kMaxPasses)
+        return false;
+    wchar_t leaf[32];
+    std::swprintf(leaf, 32, L"amd-nr-pass%u.dll", slot + 1);
+    const auto copy = ExeDirectory() / leaf;
+    std::error_code ec;
+    std::filesystem::copy_file(g.runtimeFile, copy,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec)
+    {
+        Log("pass %u: could not write %ls (%s)", slot + 1, copy.c_str(), ec.message().c_str());
+        return false;
+    }
+    HMODULE h = LoadLibraryExW(copy.c_str(), nullptr,
+                               LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (h == nullptr)
+    {
+        Log("pass %u: LoadLibrary failed for %ls (error %lu)", slot + 1, leaf, GetLastError());
+        return false;
+    }
+    HMODULE pinned {};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       reinterpret_cast<LPCWSTR>(h), &pinned);
+    if (!ArmRuntime(h))
+    {
+        Log("pass %u: its own copy of the runtime did not initialise; it stays loaded, unused, "
+            "since what it started cannot be unloaded safely.", slot + 1);
+        return false;
+    }
+    g.runtimes[slot] = h;
+    Log("pass %u: running through its own copy of the runtime (%ls), so it carries its own "
+        "temporal state instead of alternating with pass 1's.", slot + 1, leaf);
+    return true;
+}
+
+bool InitEngine()
+{
+    if (g.runtime != nullptr)
+        return true;
+    const auto dir = ExeDirectory();
+    const auto dll = dir / L"dlssnr_amd_pass1.dll";
+    const auto weights = dir / L"dlssnr_on_amd_weights.bin";
+    std::error_code ec;
+    if (!std::filesystem::exists(dll, ec))
+    {
+        Log("missing: %ls", dll.c_str());
+        return false;
+    }
+    if (!std::filesystem::exists(weights, ec))
+    {
+        Log("missing: %ls", weights.c_str());
+        return false;
+    }
+    if (IdentifyRuntime(dll) == nullptr)
+    {
+        // Said in the panel too. This is the one failure a user can actually fix, and the log
+        // line above it says which file and which builds, so pointing at the log is worth it.
+        g.status.reason = "dlssnr_amd_pass1.dll is not a danielblnc build this add-on knows; "
+                   "see amd-nr.log";
+        Log("off: %s", g.status.reason);
+        return false;
+    }
+    if (!InitHip())
+        return false;
+
+    EnsureEngineIni(dir);
+
+    const auto loadFrom = RuntimeCopyUsingPrivateD3D12(dll);
+    HMODULE h = LoadLibraryExW(loadFrom.c_str(), nullptr,
+                               LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (h == nullptr)
+    {
+        Log("LoadLibrary failed for the runtime (error %lu).", GetLastError());
+        return false;
+    }
+    HMODULE pinned {};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       reinterpret_cast<LPCWSTR>(h), &pinned);
+
+    // Armed once, before the first raw write into the runtime. Everything below this line is a
+    // hardcoded offset into someone else's binary, and the failure mode of getting one wrong is a
+    // jump into nothing -- see NullJumpProbe.
+    if (g_probe == nullptr)
+        g_probe = AddVectoredExceptionHandler(1, NullJumpProbe);
+    Log("input contract: encoding %d, tonemap requested %d -> runtime %d; FP16 is transport, "
+        "not a colour-space declaration. Restart after changing encoding or tonemap.",
+        g.settings.encoding.load(), g.settings.tonemap.load(), RuntimeTonemap());
+    if (!ArmRuntime(h))
+        return false;
+    g.runtime = h;
+    g.runtimes[0] = h;
+    g.runtimeFile = loadFrom;
+    g.engineReady = true;
+    Log("engine ready.");
+    const int budget = At<int>(h, rt::B->kWaitBudgetMax);  // read only: the ini is the person's
+    Log("engine watchdog budget %d ms (InlineWaitMs)%s", budget, budget > 200 ? ". WARNING: over the "
+        "engine's own 200 ms, a stuck job holds the game's queue that long every frame" : "");
+
+    // Structure / Skin / Tone are written to three offsets that were found by matching strings in
+    // the binary. That the runtime *contains* the names does not prove it reads these words, and
+    // an offset that is written but never read looks identical from out here. Dump the float
+    // window around them once, right after the engine set its own defaults: a field the engine
+    // owns holds a plausible default (0, 1, or something in between), while a field nothing uses
+    // stays at whatever it was. Read-only -- this writes nothing.
+    {
+        char line[512];
+        int n = std::snprintf(line, sizeof(line), "engine floats 0x%zx..0x%zx:", rt::B->kFloatDumpFirst,
+                              rt::B->kFloatDumpLast);
+        for (size_t rva = rt::B->kFloatDumpFirst;
+             rva <= rt::B->kFloatDumpLast && n > 0 && n < static_cast<int>(sizeof(line));
+             rva += 4)
+            n += std::snprintf(line + n, sizeof(line) - n, " [%zx]=%.3f", rva,
+                               static_cast<double>(At<float>(h, rva)));
+        Log("%s", line);
+        // Dump the byte window the engine has just finished initialising. A field the engine
+        // owns holds a plausible default; a field nothing uses holds whatever the loader left.
+        // This is read-only and runs after init, so what it prints is the engine's own state.
+        n = std::snprintf(line, sizeof(line), "engine bytes 0x%zx..0x%zx:", rt::B->kByteDumpFirst,
+                          rt::B->kByteDumpLast);
+        for (size_t rva = rt::B->kByteDumpFirst;
+             rva <= rt::B->kByteDumpLast && n > 0 && n < static_cast<int>(sizeof(line));
+             ++rva)
+            n += std::snprintf(line + n, sizeof(line) - n, " %02x",
+                               static_cast<unsigned>(At<uint8_t>(h, rva)));
+        Log("%s", line);
+        Log("  %zx is DepthInverted, pinned to the engine's own default of 1 and no longer a "
+            "control. %zx UseAutoMask, %zx ToneChannels and %zx Scale are the fields the "
+            "Engine tab writes; what they read back as here is the engine's own state before "
+            "this add-on touches them.",
+            rt::B->kDepthInverted, rt::B->kUseAutoMask, rt::B->kToneChannels, rt::B->kScale);
+        Log("  written by this add-on: %zx tone, %zx structure, %zx skin. If one of those "
+            "reads back as something this add-on never wrote, the engine owns it. To find out "
+            "whether they change the picture, run the same scene twice with Skin at 0 and at 3 "
+            "and compare the 'measure, residual' line -- if it does not move, the slider is inert.",
+            rt::B->kLocalTone, rt::B->kLocalStructure, rt::B->kSkinStructure);
+    }
+    return true;
+}
+
+bool CompileShader(const char *source, size_t size, const char *name, ComPtr<ID3D12PipelineState> &out)
+{
+    ComPtr<ID3DBlob> blob, error;
+    if (FAILED(p_D3DCompile(source, size, name, nullptr, nullptr, "main", "cs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &error)))
+    {
+        Log("shader %s failed to compile: %s", name,
+            error != nullptr ? static_cast<const char *>(error->GetBufferPointer()) : "?");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC ps {};
+    ps.pRootSignature = g.root.Get();
+    ps.CS = { blob->GetBufferPointer(), blob->GetBufferSize() };
+    return SUCCEEDED(g.device->CreateComputePipelineState(&ps, IID_PPV_ARGS(&out)));
+}
+
+bool InitPipeline()
+{
+    if (g.root != nullptr)
+        return true;
+    D3D12_DESCRIPTOR_RANGE ranges[2] {};
+    ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0 };
+    ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 3 };
+    D3D12_ROOT_PARAMETER params[2] {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable = { 2, ranges };
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    // Fifteen, not eight: compose needs seven more than the rest -- the residual limit, the edge
+    // fade, the colour strength, the highlight guard, and the three style coefficients. A shader
+    // declaring a shorter cbuffer over a longer root constant block is fine, so the other six
+    // keep passing eight.
+    params[1].Constants = { 0, 0, 15 };
+    D3D12_STATIC_SAMPLER_DESC smp {};
+    smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp.MaxLOD = D3D12_FLOAT32_MAX;
+    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC desc { 2, params, 1, &smp, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+    ComPtr<ID3DBlob> blob, error;
+    if (FAILED(p_D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
+        FAILED(g.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                             IID_PPV_ARGS(&g.root))))
+    {
+        Log("root signature failed.");
+        return false;
+    }
+    if (!CompileShader(shaders::kCopyShader, sizeof(shaders::kCopyShader), "copy", g.copyPipeline) ||
+        !CompileShader(shaders::kDepthShader, sizeof(shaders::kDepthShader), "depth", g.depthPipeline) ||
+        !CompileShader(shaders::kComposeShader, sizeof(shaders::kComposeShader), "compose", g.composePipeline) ||
+        !CompileShader(shaders::kResidualShader, sizeof(shaders::kResidualShader), "residual", g.residualPipeline) ||
+        !CompileShader(shaders::kLumaShader, sizeof(shaders::kLumaShader), "luma", g.lumaPipeline) ||
+        !CompileShader(shaders::kFlowShader, sizeof(shaders::kFlowShader), "flow", g.flowPipeline) ||
+        !CompileShader(shaders::kFlowUpShader, sizeof(shaders::kFlowUpShader), "flowup", g.flowUpPipeline))
+        return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128,
+                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    return SUCCEEDED(g.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)));
+}
+
+bool CreateTexture(UINT w, UINT h, DXGI_FORMAT f, ComPtr<ID3D12Resource> &out, const char *what,
+                   D3D12_RESOURCE_STATES initialState)
+{
+    out.Reset();
+    D3D12_HEAP_PROPERTIES hp {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w;
+    rd.Height = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = f;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(g.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, initialState,
+                                                 nullptr, IID_PPV_ARGS(&out))))
+    {
+        Log("texture creation failed: %s %ux%u format %d", what, w, h, static_cast<int>(f));
+        return false;
+    }
+    return true;
+}
+
+bool EnsureResources(UINT w, UINT h, DXGI_FORMAT outFormat, float scale)
+{
+    UINT nw = std::max<UINT>(64u, static_cast<UINT>(w * scale + 0.5f));
+    UINT nh = std::max<UINT>(64u, static_cast<UINT>(h * scale + 0.5f));
+
+    // Some games do not present at a fixed size, and following every flap would re-stage the
+    // engine and destroy the textures it holds zero-copy handles to while it may still read them.
+    // Both shaders resample between back buffer and raster either way, so a held raster costs a
+    // resample; RasterPin decides when a new size has lasted long enough to follow.
+    //
+    // But the pin must not swallow a *deliberate* change. It used to compare sizes only, so it
+    // could not tell "the window twitched" from "the user moved Resolution Scale" -- and since a
+    // new scale always produces a new size, the slider was inert from frame 2 onward. Setting it
+    // to 1.00 left the raster at the 0.50 it booted with, which is exactly the "the network does
+    // nothing to textures" report: the network never got a full-resolution frame to work on.
+    // Keying the pin on the scale that built the current raster separates the two.
+    const bool scaleChanged = scale != g.pinnedScale;
+    g.pinnedScale = scale;
+    if (g.engineReady && g.netWidth != 0 && !scaleChanged &&
+        g.rasterPin.Keep(nw, nh, g.netWidth, g.netHeight))
+    {
+        if (!g.loggedPin)
+        {
+            g.loggedPin = true;
+            Log("back buffer changed to %ux%u, which wants a %ux%u raster; keeping the raster at "
+                "%ux%u so the engine is not re-staged over a window twitch. Further flaps are not "
+                "logged; a size over 2%% off that lasts %u presents re-rasters, as Scale does.",
+                w, h, nw, nh, g.netWidth, g.netHeight, RasterPin::kHold);
+        }
+        nw = g.netWidth;
+        nh = g.netHeight;
+    }
+
+    const bool netChanged = g.netWidth != nw || g.netHeight != nh || g.netColour == nullptr;
+    const bool outChanged = g.outWidth != w || g.outHeight != h || g.outFormat != outFormat ||
+                            g.composed == nullptr;
+    if (!netChanged && !outChanged)
+        return true;
+
+    // Everything below releases a texture and makes a new one. D3D12 does not keep a resource
+    // alive just because an in-flight command list still references it, and last frame's
+    // CopyResource out of `composed` can still be running when the back buffer resizes. Dropping
+    // it there is a use-after-free on the GPU. Wait for the queue to catch up first -- this only
+    // costs anything on an actual size change, which is rare.
+    if (g.fence != nullptr && g.fence->GetCompletedValue() < g.completion)
+    {
+        if (HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr))
+        {
+            const bool idle = WaitFence(g.fence.Get(), g.completion, done,
+                                        "the old raster before changing resolution");
+            CloseHandle(done);
+            if (!idle)
+                return false;  // WaitFence stood the add-on down and set the reason
+        }
+        else return false;
+    }
+
+    // That fence covers our own queue. It says nothing about a network job the engine still has
+    // in flight -- and the engine holds zero-copy handles into netColour/netMotion/netDepth, so
+    // releasing them underneath a running job is a use-after-free on the GPU. Only reachable on
+    // a real geometry change, which is rare, so a blocking wait here costs nothing in practice.
+    if (g.engineReady && g.runtime != nullptr)
+    {
+        const UINT64 deadline = GetTickCount64() + 5000;
+        while (RuntimeBusy() && GetTickCount64() < deadline)
+            Sleep(1);
+        if (RuntimeBusy())
+        {
+            // A stuck job: park what the engine may hold and go on. It stays outstanding, so
+            // JobGate records nothing until the runtime retires it.
+            // ponytail: a raster of VRAM per stuck change.
+            Log("raster: runtime job %u did not become idle in 5 s; parking its textures.", g.lastJob);
+            if (netChanged)
+                g.parked.insert(g.parked.end(), { g.netColour, g.netMotion, g.netDepth, g.history[0],
+                                                  g.history[1], g.history[2] });
+        }
+        else
+            g.parked.clear();
+    }
+
+    // The bridge owns three reusable command lists. A completed list may still retain driver-side
+    // bookkeeping for every resource recorded into it until Reset, which makes rapid resolution
+    // changes look like a VRAM leak even after the corresponding ComPtr is released. The UI now
+    // commits one scale after an edit instead of one per mouse movement; retire all three lists
+    // at that single boundary so the old raster has no command-list lifetime left either.
+    if (netChanged && g.bridge.workDevice != nullptr)
+    {
+        for (UINT i = 0; i < State::kRing; ++i)
+        {
+            if (RecreateWorkSlot(i))
+                continue;
+            Log("raster: could not retire work slot %u before changing resolution.", i);
+            return false;
+        }
+    }
+
+    const DXGI_FORMAT composeFormat = ColourReadFormat(outFormat);
+    if (!HasTypedUavStore(g.device.Get(), composeFormat))
+    {
+        Log("this GPU/driver has no typed UAV store for the back buffer format (DXGI %d, read as "
+            "%d), so there is no way to write the corrected image back. Stopping instead of "
+            "drawing garbage. Try turning HDR off, or a different swapchain format.",
+            static_cast<int>(outFormat), static_cast<int>(composeFormat));
+        g.status.reason = "back buffer format has no typed UAV store on this driver";
+        return false;
+    }
+
+    // Only the textures whose geometry actually moved get rebuilt. composed has to match the back
+    // buffer because it is CopyResource'd into it; the network textures must not be touched while
+    // the engine is using them.
+    // Flow runs on a luminance image an eighth the size. Full resolution would cost the square
+    // of that for no gain: the search window is what limits how fast a motion can be tracked, and
+    // a coarse field upsamples cleanly because real motion is mostly low frequency.
+    const UINT fw = std::max<UINT>(16u, nw / 8u);
+    const UINT fh = std::max<UINT>(16u, nh / 8u);
+
+    if (netChanged &&
+        (!CreateTexture(nw, nh, DXGI_FORMAT_R16G16B16A16_FLOAT, g.netColour, "netColour") ||
+         !CreateTexture(nw, nh, DXGI_FORMAT_R16G16B16A16_FLOAT, g.netBase, "netBase") ||
+         !CreateTexture(nw, nh, DXGI_FORMAT_R16G16B16A16_FLOAT, g.netResidual, "netResidual") ||
+         !CreateTexture(nw, nh, DXGI_FORMAT_R16G16_FLOAT, g.netMotion, "netMotion") ||
+         !CreateTexture(nw, nh, DXGI_FORMAT_R32_FLOAT, g.netDepth, "netDepth") ||
+         !CreateTexture(fw, fh, DXGI_FORMAT_R16_FLOAT, g.lumaA, "lumaA") ||
+         !CreateTexture(fw, fh, DXGI_FORMAT_R16_FLOAT, g.lumaB, "lumaB") ||
+         !CreateTexture(fw, fh, DXGI_FORMAT_R16G16_FLOAT, g.flowSmall, "flowSmall") ||
+         !CreateTexture(fw, fh, DXGI_FORMAT_R16G16_FLOAT, g.flowCoarse, "flowCoarse")))
+        return false;
+    // One per pass. Built for every slot rather than for the current pass count, because the
+    // count is a live control: allocating on demand would put a texture creation in the middle
+    // of a frame the first time somebody moves the slider. Three at 1306x662 RGBA16F is 10 MB.
+    if (netChanged)
+    {
+        for (UINT i = 0; i < State::kMaxPasses; ++i)
+        {
+            char name[16];
+            std::snprintf(name, sizeof(name), "history%u", i + 1);
+            if (!CreateTexture(nw, nh, DXGI_FORMAT_R16G16B16A16_FLOAT, g.history[i], name))
+                return false;
+        }
+        ResetTemporal("the network raster was rebuilt");
+        g.flowWidth = fw;
+        g.flowRuns = 0;
+        g.flowHeight = fh;
+    }
+    if (outChanged && !CreateTexture(w, h, composeFormat, g.composed, "composed"))
+        return false;
+
+    g.outWidth = w;
+    g.outHeight = h;
+    g.netWidth = nw;
+    g.netHeight = nh;
+    g.outFormat = outFormat;
+    Log("raster: back buffer %ux%u format %d, network at %ux%u (scale %.2f)", w, h,
+        static_cast<int>(outFormat), nw, nh, static_cast<double>(scale));
+    return true;
+}
+
+// True on a thread while this add-on is issuing commands into the host's API on its own account.
+//
+// On D3D11 and D3D12 that distinction never mattered: the bridge records into its own command
+// list on its own device, and ReShade has nothing to say about it. In OpenGL there is no such
+// separation. Every call the route makes goes through the same hooked entry points the game uses,
+// so ReShade reports the route's own glBindFramebuffer back to this add-on as a render-target
+// bind -- on the present thread, inside OnPresent, which already holds g.lock. The second lock on
+// a std::mutex from the same thread does not deadlock under MSVC: it throws std::system_error,
+// which is unhandled, which closes the game. That is exactly how the OpenGL route's first run
+// ended, with the log stopping mid-way through building the crossing and an E06D7363 in
+// KERNELBASE to show for it.
+//
+// So the observers ignore what this add-on did itself. They would be wrong to count it in any
+// case: the route's binds are not the game drawing its frame.
+thread_local bool g_selfIssued = false;
+
+struct SelfIssued
+{
+    SelfIssued() { g_selfIssued = true; }
+    ~SelfIssued() { g_selfIssued = false; }
+    SelfIssued(const SelfIssued &) = delete;
+    SelfIssued &operator=(const SelfIssued &) = delete;
+};
+
+// ReShade fires the add-on's `present` event BEFORE it renders its own effect chain: on D3D11
+// dxgi_swapchain.cpp invokes addon_event::present and only then present_effect_runtime, whose
+// on_present is what calls render_effects. So a texture the companion effect writes, read from
+// inside OnPresent, still holds what the chain produced for the PREVIOUS frame. The network was
+// being handed frame N's colour with frame N-1's flow -- vectors that describe a motion the
+// picture has already finished making -- which is why an eight-level Launchpad pyramid measured
+// no different from the two-level estimator it was meant to replace.
+//
+// The fix is to run the chain here, ahead of the copy that carries the back buffer across.
+// runtime::render_effects refuses to run twice in one frame (_effects_rendered_this_frame), so
+// ReShade's own on_present then skips straight to the overlay, and the frame the user sees is
+// still the composed one. Only when the effect is ticked: without it the chain keeps its usual
+// place after the network, which is what every other user of this add-on has today.
+//
+// Marked self-issued because ReShade reports the chain's own render-target binds back through
+// OnBindDepthStencil, which takes g.lock -- and the caller already holds it.
+void RenderEffectsAheadOfNetwork(device *dev, resource back)
+{
+    if (g.effects == nullptr || !g.settings.useFeedEffect.load() ||
+        !TechniqueOn("AMD_Neural_Feed.fx", "AMD_Neural_Feed"))
+        return;
+    command_queue *queue = g.effects->get_command_queue();
+    if (queue == nullptr)
+        return;
+    // render_effects returns without drawing when the view is zero, so it needs a real one.
+    // ponytail: a view per frame; cache it by back-buffer handle if it ever shows in a profile.
+    const resource_desc bd = dev->get_resource_desc(back);
+    resource_view rtv {};
+    if (!dev->create_resource_view(back, resource_usage::render_target,
+                                   resource_view_desc(format_to_default_typed(bd.texture.format, 0)),
+                                   &rtv))
+        return;
+    {
+        SelfIssued self;
+        g.effects->render_effects(queue->get_immediate_command_list(), rtv, resource_view {});
+    }
+    dev->destroy_resource_view(rtv);
+    if (!g.loggedEffectsFirst)
+    {
+        g.loggedEffectsFirst = true;
+        Log("effects: AMD_Neural_Feed is on, so ReShade's chain now runs before the network "
+            "each frame and the guides it hands over are this frame's, not last frame's.");
+    }
+}
+
+void OnBindDepthStencil(command_list *cmd_list, uint32_t count, const resource_view *rtvs,
+                        resource_view dsv)
+{
+    if (g_selfIssued)
+        return;
+    device *dev = cmd_list != nullptr ? cmd_list->get_device() : nullptr;
+    if (dev == nullptr)
+        return;
+    FrameTransport *transport = TransportFor(dev->get_api());
+    const resource res = dsv.handle != 0 ? dev->get_resource_from_view(dsv) : resource { 0 };
+    if (dsv.handle != 0)
+    {
+        ++g.depthEvents;
+        // Observation is API-agnostic on purpose. Registering the draw events did not make D3D12
+        // deliver a single depth-stencil bind in 600 frames, so the question "does this game expose
+        // depth to an add-on at all" can only be answered on the other API -- and answering it must
+        // not require the D3D11 bridge to already exist. ReShade's own resource_desc reads on both;
+        // the native reads do not, so they are each transport's own.
+        static std::atomic<UINT> logged { 0 };
+        if (res.handle != 0 && logged < 8 && logged++ < 8)
+        {
+            std::lock_guard observe(g.lock);  // for these eight lines, not on every bind the game makes
+            const resource_desc rd = dev->get_resource_desc(res);
+            Log("depth seen (%s): %ux%u format %u samples %u",
+                transport != nullptr ? transport->Name() : "other API", rd.texture.width,
+                rd.texture.height, static_cast<unsigned>(rd.texture.format), rd.texture.samples);
+        }
+    }
+    if (transport != nullptr)
+        transport->OnTargetsBound(dev, count, rtvs, res);
+}
+
+// Subscribing to the draw events is what makes ReShade track render-target state on the game's
+// own command lists. Without a subscriber it only reports the swapchain, which is the whole of
+// "on D3D12 an add-on sees two render targets and no depth" -- the probe add-on registers these
+// and sees eight, depth included, on the same game. Being registered is the point; all they do is
+// count draws for the D3D11 depth pick (d3d11_guides.h). Returning false lets the draw proceed.
+bool OnDraw(command_list *, uint32_t, uint32_t, uint32_t, uint32_t) { d3d11guides::CountDraw(); return false; }
+bool OnDrawIndexed(command_list *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) { d3d11guides::CountDraw(); return false; }
+// A GPU-driven engine draws its scene through DrawIndexedInstancedIndirect; a dispatch draws into no depth.
+bool OnDrawIndirect(command_list *, reshade::api::indirect_command type, resource, uint64_t, uint32_t count, uint32_t)
+{
+    if (type == reshade::api::indirect_command::draw || type == reshade::api::indirect_command::draw_indexed)
+        for (uint32_t i = 0; i < count; ++i)
+            d3d11guides::CountDraw();
+    return false;
+}
+
+// Reading the depth buffer at present time returns zeros: PCSX2 has already cleared it by then.
+// The only moment its contents exist is immediately before the clear, so take the copy here.
+// ReShade calls this before performing the clear, and returning false lets the clear happen.
+bool OnClearDepth(command_list *cmd_list, resource_view dsv, const float *, const uint8_t *,
+                  uint32_t, const rect *)
+{
+    if (g_selfIssued || cmd_list == nullptr || dsv.handle == 0)
+        return false;
+    device *dev = cmd_list->get_device();
+    if (dev == nullptr)
+        return false;
+    if (FrameTransport *transport = TransportFor(dev->get_api()))
+        transport->OnDepthCleared(cmd_list, dev, dsv);
+    return false;
+}
+
+// ReShade calls this from inside its ResizeBuffers hook, just before handing the call to DXGI.
+// That is the one moment where the back buffer has to be completely unreferenced, and where
+// dropping the pipeline state costs nothing because the swapchain is about to be rebuilt.
+//
+// This is what killed NFS on the way to fullscreen. DXGI refuses ResizeBuffers with
+// DXGI_ERROR_INVALID_CALL while anything still references a back buffer, and D3D11 counts a
+// command list that merely *used* the resource -- the two CopyResource calls the bridge makes
+// every frame -- as a reference. The game reports the refusal as a DirectX error and quits.
+// Flushing per frame is not enough on its own: OnDestroySwapchain drains the bridge's work with an
+// event query first.
+// Everything sized to the swapchain, dropped together. Ensure rebuilds each one on demand.
+void ReleaseSwapchainSized()
+{
+    // A wait that gave up (FenceWaitCapMs) stood the add-on down: it all stays parked, bar on a dead device.
+    if (!WaitForWorkQueue(g.completion) && !DeviceLost())
+        return;
+    for (FrameTransport *transport : AllTransports())
+        transport->ReleaseSwapchainSized();
+    // Closed command lists retain references to their recorded resources until Reset. Retire all
+    // slots while the queue is idle so no recording from the old swapchain survives the teardown.
+    if (g.bridge.workDevice != nullptr)
+    {
+        for (UINT i = 0; i < State::kRing; ++i)
+        {
+            if (RecreateWorkSlot(i))
+                continue;
+            g.bridge.failed = true;
+            g.status.unavailable = true;
+            g.status.reason = "could not retire the D3D12 work slots during swapchain teardown";
+            break;
+        }
+    }
+    g.bridge.in.Destroy();
+    g.bridge.out.Destroy();
+    g.bridge.crossLocal.Reset();
+    g.bridge.stageIn11.Reset();
+    g.bridge.stageOut11.Reset();
+    g.bridge.stageW = g.bridge.stageH = 0;
+    g.bridge.stageFmt = DXGI_FORMAT_UNKNOWN;
+    for (Guide *guide : { &g.guideDepth, &g.guideMotion })
+    {
+        guide->chosen.Reset();
+        guide->srv.Reset();
+        guide->srvOf = nullptr;
+        guide->uav.Reset();
+        guide->uavOf = nullptr;
+        guide->snap.Reset();
+        guide->snapW = guide->snapH = 0;
+        guide->bridge.Destroy();
+        guide->local.Reset();
+        guide->ready = false;
+        // A raw identity pointer must not outlive the resources it was compared against: the
+        // next allocation the game makes can land on the same address.
+        guide->challenger = nullptr;
+        guide->challengerFrames = 0;
+        guide->coldFrames = 0;
+    }
+    g_depthTally.clear();
+    g_motionTally.clear();
+    g.gameDepthActive = g.gameMotionActive = false;
+    g.jobRunning = false;  // the queue is idle, and no job spans a rebuild; history stays
+    g.outWidth = g.outHeight = 0;
+}
+
+#include "lifecycle.inc"
+
+bool ToggleRequested()
+{
+    static bool down = false;
+    const int key = g.settings.toggleKey.load(), mods = g.settings.toggleMods.load();
+    const auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    const bool modsOk = (!(mods & 1) || held(VK_CONTROL)) && (!(mods & 2) || held(VK_MENU)) &&
+                        (!(mods & 4) || held(VK_SHIFT));
+    const bool now = key != 0 && modsOk && held(key);
+    const bool pressed = now && !down;
+    down = now;
+    return pressed;
+}
+
+// The bound key as the user's keyboard layout spells it. See hotkey_capture.h.
+std::string HotkeyName()
+{
+    return hotkey::Name(g.settings.toggleKey.load(), g.settings.toggleMods.load());
+}
+
+// What compose is allowed to move a pixel by, this frame.
+//
+// Zero stays zero -- that is the additive path, not a guard of nothing. Above it, the guard is a
+// bound on the *finished* composition while the passes compound the ratio inside it, so a fixed
+// value means the second and third pass spend their contribution against the clamp and cost
+// frametime for nothing. One extra pass, one extra multiple of headroom.
+float EffectiveGuard()
+{
+    const float base = g.settings.ratioGuard.load();
+    if (base <= 0.0f || !g.settings.guardTracksPasses.load())
+        return base;
+    const UINT running = std::max(1u, g.activePasses);
+    return base + static_cast<float>(running - 1);
+}
+
+// What one pass of the network is told. The globals unless that pass carries its own profile.
+struct PassTune
+{
+    float structure, tone, skin;
+};
+
+PassTune TuningFor(UINT pass)
+{
+    if (pass < State::kMaxPasses && g.settings.passOverride[pass].load())
+        return { g.settings.passStructure[pass].load(), g.settings.passTone[pass].load(), g.settings.passSkin[pass].load() };
+    // Local Tone on the first pass only, and full Structure on every pass. That is not a guess and
+    // it is not symmetry for its own sake -- it is what the reference fork does, in one line of
+    // PassProfiles.h:
+    //
+    //     pass == 0 ? cfg.DlssNrLocalTone.value_or_default() : 0.0f
+    //
+    // This add-on had it right and then lost it. The old code was `i == 0 ? tone : 0.0f`, which
+    // last session read as an asymmetry nobody chose and was "fixed" into giving every pass the
+    // same value. It was chosen, upstream, deliberately: local tone is a tone decision about the
+    // frame, and a second pass re-deciding the tone of a frame whose tone the first pass already
+    // moved is how a chain runs away from the picture it started with.
+    PassTune t { g.settings.structure.load(), pass == 0 ? g.settings.tone.load() : 0.0f, g.settings.skin.load() };
+    // Ours, on top, and off by default: the reference does not taper structure and nothing here
+    // has measured that it should. Skin is never tapered -- -1 is the engine's own default and it
+    // means "follow local structure", so it is a mode and not a strength.
+    if (pass > 0 && g.settings.passTaper.load())
+        t.structure *= std::pow(0.5f, static_cast<float>(pass));
+    return t;
+}
+
+// Whether the controls a pass is about to receive differ from the ones it received last time.
+// This is CG2R_ResetTemporalHistoryOnControlChange, measured on the ETS2 trace rather than read:
+// the NVIDIA DLL drops the history when Style, UseAutoMask, LocalTone, LocalStructure or Skin
+// change -- ints exactly, floats beyond 1e-5 -- and keeps it when Intensity does. Checked where
+// the values are written, so every road to them (overlay, ini reload, per-pass profile, taper,
+// the override) is one comparison instead of a reset in every handler. The first observation
+// only records; there is no history to drop yet.
+bool ControlsChanged(UINT slot, const PassTune &t, float outScale, int autoMask, int style)
+{
+    struct Ctl { float tone, structure, skin, scale; int mask, style; bool seen; };
+    static Ctl last[State::kMaxPasses] {};
+    Ctl &l = last[std::min(slot, State::kMaxPasses - 1)];
+    const auto moved = [](float a, float b) { return std::fabs(a - b) > 1e-5f; };
+    const bool changed = l.seen && (moved(l.tone, t.tone) || moved(l.structure, t.structure) ||
+                                    moved(l.skin, t.skin) || moved(l.scale, outScale) ||
+                                    l.mask != autoMask || l.style != style);
+    l = { t.tone, t.structure, t.skin, outScale, autoMask, style, true };
+    return changed;
+}
+#include "mochizuki.inc"
+
+#include "../temporal/optical_flow.inc"
+#include "../temporal/motion_feed.inc"
+#include "../temporal/smooth.inc"
+#include "../temporal/seed.inc"
+
+// Everything the network does in one frame, recorded into whatever command list it is handed.
+// `colourSrc` is the image to work from and must already be readable as a shader resource; the
+// composed result is left in g.composed and copied into `outTarget` when one is given. Pulling
+// this out of OnPresent is what lets the same pipeline run on a device that is not the game's:
+// the D3D12 path passes the swapchain back buffer, the D3D11 bridge passes shared textures it
+// carries in and out. Nothing in here knows or cares which.
+bool RecordNetwork(ID3D12GraphicsCommandList *&cmd, ID3D12Resource *colourSrc,
+                   DXGI_FORMAT colourFmt, ID3D12Resource *outTarget, bool runNetwork, UINT wanted,
+                   const SubmitPassFn &submitPass)
+{
+    if (HeapStillRead(runNetwork))
+        return false;
+    const UINT w = g.outWidth, h = g.outHeight, nw = g.netWidth, nh = g.netHeight;
+    const UINT inc = g.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const auto heapStart = g.heap->GetCPUDescriptorHandleForHeapStart();
+    auto slot = [&](UINT i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = heapStart;
+        handle.ptr += static_cast<SIZE_T>(i) * inc;
+        return handle;
+    };
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+
+    srv.Format = ColourReadFormat(colourFmt);
+    for (UINT i = 0; i < 3; ++i)
+        g.device->CreateShaderResourceView(colourSrc, &srv, slot(i));
+    uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g.device->CreateUnorderedAccessView(g.netColour.Get(), nullptr, &uav, slot(3));
+
+    srv.Format = ColourReadFormat(colourFmt);
+    g.device->CreateShaderResourceView(colourSrc, &srv, slot(8));
+    srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g.device->CreateShaderResourceView(g.netResidual.Get(), &srv, slot(9));
+    // Network Output reaches the shader as view 2, which is the same path the debug view has
+    // always drawn: bind netColour to the debug slot and let compose sample it instead of
+    // building a composition. Reusing it rather than adding a second one means the mode cannot
+    // drift away from the picture that was actually tested. An explicit Debug View still wins,
+    // so the diagnostics stay usable with the mode on.
+    // 6 rather than 2 so the shader can tell the mode from the debug view.
+    const int dbg = g.settings.debugView.load() != 0 ? g.settings.debugView.load() : (g.settings.networkOutput.load() ? 6 : 0);
+    if (dbg == 2 || dbg == 6)
+    {
+        g.device->CreateShaderResourceView(g.netColour.Get(), &srv, slot(10));
+    }
+    else if (dbg == 4 && g.netMotion != nullptr)
+    {
+        srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        g.device->CreateShaderResourceView(g.netMotion.Get(), &srv, slot(10));
+    }
+    else if (dbg == 5 && g.netDepth != nullptr)
+    {
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        g.device->CreateShaderResourceView(g.netDepth.Get(), &srv, slot(10));
+    }
+    else
+    {
+        g.device->CreateShaderResourceView(g.netBase.Get(), &srv, slot(10));
+    }
+    srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    uav.Format = ColourReadFormat(colourFmt);
+    g.device->CreateUnorderedAccessView(g.composed.Get(), nullptr, &uav, slot(11));
+
+    g.device->CreateShaderResourceView(g.netColour.Get(), &srv, slot(28));
+    g.device->CreateShaderResourceView(g.netBase.Get(), &srv, slot(29));
+    g.device->CreateShaderResourceView(g.netBase.Get(), &srv, slot(30));
+    uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    g.device->CreateUnorderedAccessView(g.netResidual.Get(), nullptr, &uav, slot(31));
+
+    // netColour minus netBase, into netResidual. Emitted wherever the pair is known to match.
+    auto captureResidual = [&]() {
+        auto t = g.heap->GetGPUDescriptorHandleForHeapStart();
+        t.ptr += static_cast<UINT64>(28) * inc;
+        cmd->SetComputeRootSignature(g.root.Get());
+        ID3D12DescriptorHeap *h = g.heap.Get();
+        cmd->SetDescriptorHeaps(1, &h);
+        cmd->SetPipelineState(g.residualPipeline.Get());
+        cmd->SetComputeRootDescriptorTable(0, t);
+        UINT d[8] { nw, nh, nw, nh, 0, 0, 0, 0 };
+        cmd->SetComputeRoot32BitConstants(1, 8, d, 0);
+        Barrier(cmd, g.netResidual.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmd->Dispatch((nw + 7) / 8, (nh + 7) / 8, 1);
+        Barrier(cmd, g.netResidual.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    };
+
+    const int encMode = g.settings.encoding.load();
+    const float white = std::max(1.0f, g.settings.diffuseWhite.load());
+    // Diffuse White says how many nits a value of 1.0 stands for, and the network's own unit is
+    // the reference for the encoding: 100 nits for linear BT.709, 203 for scRGB-nl. So a pixel at
+    // 1.0 has to be handed white/reference.
+    //
+    // This was `203 / white`, which is the reciprocal, with 203 used for both modes. It ran the
+    // slider backwards against its own label -- raising Diffuse White dimmed what the network saw
+    // -- and on the NFS settings (Linear, 100 nits, the documented automatic, so the scale should
+    // be exactly 1.0) it multiplied the whole linear image by 2.03 instead. Both the direction and
+    // the constant were wrong.
+    const float reference = encMode == 2 ? 203.0f : 100.0f;
+    const float kWhite = encMode == 0 ? 1.0f : white / reference;
+    // In the depth view `intensity` carries the display scale instead: the PS2 needs about x500
+    // and a modern engine x1, and the probe measures which. Nothing else in compose reads it once
+    // a debug view has taken over the output.
+    const float strength =
+        g.settings.debugView.load() == 5 ? g.depthDebugScale.load() * g.settings.intensity.load() : g.settings.intensity.load();
+
+    auto *heap = g.heap.Get();
+    if (runNetwork)
+    {
+    // We only get here with no job outstanding, so netColour holds the last completed output and
+    // netBase the input that produced it -- a matched pair, and the last moment it exists before
+    // the copy below overwrites netColour. An accepted pass re-captures after RecordFn anyway.
+    if (g.status.frame > 0)
+        captureResidual();
+
+    cmd->SetComputeRootSignature(g.root.Get());
+    cmd->SetDescriptorHeaps(1, &heap);
+    cmd->SetPipelineState(g.copyPipeline.Get());
+    cmd->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    UINT dims[8] { nw, nh, w, h, static_cast<UINT>(encMode), 0, 0, 0 };
+    std::memcpy(&dims[5], &kWhite, sizeof(float));
+    std::memcpy(&dims[6], &strength, sizeof(float));
+    cmd->SetComputeRoot32BitConstants(1, 8, dims, 0);
+    Barrier(cmd, g.netColour.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cmd->Dispatch((nw + 7) / 8, (nh + 7) / 8, 1);
+    Barrier(cmd, g.netColour.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    Barrier(cmd, g.netBase.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd->CopyResource(g.netBase.Get(), g.netColour.Get());
+    Barrier(cmd, g.netBase.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(cmd, g.netColour.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    bool haveDepth = false;
+    // Two ways depth can arrive, in descending order of how much it is worth. From the game over
+    // the bridge: a real, full-range depth buffer an engine wrote and left alone, as RenoDX gets on
+    // NVIDIA. From the D3D12 pre-clear snapshot, what PCSX2 allows: only one of the buffer the pick
+    // holds, taken at most two presents ago, else none. The live D3D12 buffer is never read: zeros.
+    const bool fromGame = g.gameDepthActive && g.guideDepth.local != nullptr;
+    if (g.settings.useDepth.load() && (fromGame || g.SnapshotFresh()))
+    {
+        ID3D12Resource *depthSource = fromGame ? g.guideDepth.local.Get() : g.depthSnapshot.Get();
+        const auto dd = depthSource->GetDesc();
+        srv.Format = DepthReadFormat(dd.Format);
+        for (UINT i = 4; i < 7; ++i)
+            g.device->CreateShaderResourceView(depthSource, &srv, slot(i));
+        uav.Format = DXGI_FORMAT_R32_FLOAT;
+        g.device->CreateUnorderedAccessView(g.netDepth.Get(), nullptr, &uav, slot(7));
+        Barrier(cmd, g.netDepth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmd->SetPipelineState(g.depthPipeline.Get());
+        auto dtable = heap->GetGPUDescriptorHandleForHeapStart();
+        dtable.ptr += 4 * inc;
+        cmd->SetComputeRootDescriptorTable(0, dtable);
+        UINT ddims[8] { nw, nh, static_cast<UINT>(dd.Width), dd.Height, 0, 0, 0, 0 };
+        const float dscale = g.settings.depthNormalise.load() ? g.depthScale.load() : 1.0f;
+        std::memcpy(&ddims[4], &dscale, sizeof(float));
+        cmd->SetComputeRoot32BitConstants(1, 8, ddims, 0);
+        cmd->Dispatch((nw + 7) / 8, (nh + 7) / 8, 1);
+        Barrier(cmd, g.netDepth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        haveDepth = true;
+        if (!g.loggedDepth)
+        {
+            g.loggedDepth = true;
+            Log("depth: %llux%u format %d -> R32_FLOAT at %ux%u, source %s",
+                static_cast<unsigned long long>(dd.Width), dd.Height, static_cast<int>(dd.Format),
+                nw, nh, fromGame ? "the game's own buffer, over the bridge" : "pre-clear snapshot");
+        }
+    }
+
+    // The motion, after the depth: the optical flow's densify reads this frame's netDepth to keep
+    // an object's vectors off its background (optical_flow.inc). Neither block reads the other's
+    // descriptors, and every view below sets its own format.
+    bool haveMotion = false;
+    g_motionSinceEvaluation = false;  // the include below may set it; see DropStaleHistory
+#include "../temporal/motion_sources.inc"
+
+    // One-shot look at the two guides, once the game has settled.
+    if (g.probeGuides.load() && g.status.frame >= g.nextGuideProbe && g.netDepth != nullptr &&
+        g.netMotion != nullptr)
+    {
+        g.nextGuideProbe = g.status.frame + 600;
+        const UINT pitch = (nw * 4 + 255) & ~255u;
+        D3D12_HEAP_PROPERTIES rb {};
+        rb.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Width = static_cast<UINT64>(pitch) * nh;
+        const bool okD = SUCCEEDED(g.device->CreateCommittedResource(
+            &rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&g.guideReadDepth)));
+        const bool okM = SUCCEEDED(g.device->CreateCommittedResource(
+            &rb, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&g.guideReadMotion)));
+        if (okD && okM)
+        {
+            auto grab = [&](ID3D12Resource *src, ID3D12Resource *dst, DXGI_FORMAT f) {
+                Barrier(cmd, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION from {}, to {};
+                from.pResource = src;
+                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                to.pResource = dst;
+                to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                to.PlacedFootprint.Footprint = { f, nw, nh, 1, pitch };
+                cmd->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                Barrier(cmd, src, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            };
+            grab(g.netDepth.Get(), g.guideReadDepth.Get(), DXGI_FORMAT_R32_FLOAT);
+            grab(g.netMotion.Get(), g.guideReadMotion.Get(), DXGI_FORMAT_R16G16_FLOAT);
+            g.pendingGuides = true; g.probedDepth = haveDepth;
+            Log("guide probe armed at frame %llu: depth fed %d (handed %d), motion fed %d", g.status.frame,
+                haveDepth ? 1 : 0, haveDepth && g.depthUsable.load() ? 1 : 0, haveMotion ? 1 : 0);
+        }
+    }
+    FeedMotion(cmd, haveMotion);  // after the probe's copy, so the probe reads the field as it came
+
+    UINT accepted = 0;
+    bool nativeFailure = MzSelected() && !MzRecord(cmd, haveMotion, wanted, submitPass, accepted);
+    for (UINT i = 0; i < wanted && !MzSelected(); ++i)
+    {
+        const UINT slot = std::min(i, State::kMaxPasses - 1);
+        HMODULE r = RuntimeFor(slot);
+        // Decided before the history is looked at, so a control that changed this frame drops
+        // it now and not one frame late. See ControlsChanged for which controls and why.
+        const PassTune tune = TuningFor(i);
+        const float outScale = g.settings.engineScale.load();
+        const int autoMask = g.settings.autoMask.load();
+        const int style = std::clamp(g.settings.style.load(), 0, 2);
+        if (ControlsChanged(slot, tune, outScale, autoMask, style))
+        {
+            ResetTemporal("a pass's controls changed");
+            Log("pass %u: reset temporal history after control change (style %d, tone %.2f, structure %.2f, "
+                "skin %.2f, automask %d, output scale %.5f)",
+                i + 1, style, static_cast<double>(tune.tone), static_cast<double>(tune.structure),
+                static_cast<double>(tune.skin), autoMask, static_cast<double>(outScale));
+        }
+        PinSeed(r);
+        const bool handed = ArmHistory(r, slot);
+        if (handed)
+            PrepareHistory(cmd, slot);
+        // This byte is Temporal, not "motion is valid" -- the engine's own ini reader reads the
+        // key "Temporal" into this byte. The old name was a guess and it made the session-2
+        // measurement look unexplained: Temporal=1 was the only run where the engine reported
+        // non-zero motion, which is not a coincidence, it is what temporal accumulation is for.
+        // Auto still follows haveMotion, which is the sane default; the other two are explicit.
+        const int tm = g.settings.temporalMode.load();
+        At<uint8_t>(r, rt::B->kTemporal) =
+            static_cast<uint8_t>(tm == 1 ? 0 : tm == 2 ? 1 : (haveMotion ? 1 : 0));
+        // Never written before. UseAutoMask is the engine's own character masking -- the same
+        // field RenoDX exposes as "Character Mask" -- and it defaults to 1, so the add-on was
+        // silently relying on the default. ToneChannels and Scale were not known to exist.
+        At<int>(r, rt::B->kUseAutoMask) = autoMask;
+        // ToneChannels bits 4 and 2 were taken for the apply shader's timeout policy. On v0.3.0 and
+        // v0.4.0 they are not: the runtime builds that shader's flag word from its own state, and a
+        // timed-out inline frame after the first is shown with last frame's residual (see dropped
+        // in tools/runtime-patches.json). The worker reads this word once, as a whole: at 0 it
+        // zeroes LocalStructure before it reaches the network, and v0.3.0 zeroed LocalTone with it.
+        // So bit 4 stays set, or the network would silently run with no structure control.
+        At<int>(r, rt::B->kToneChannels) = (g.settings.toneChannels.load() & ~2) | 4;
+        // Scale IS a scale, and it is not a control of the network. It lands in the engine object
+        // right after the control floats, and from there it goes to the post kernel that writes
+        // the output, not to the pre kernel that feeds the network. Between 21/09 22:24 and 22/09
+        // 00:04 this line wrote style/128 here, on the reading that it was the NVIDIA forward's
+        // fifth control. Measured in ETS2 with Model A (0 here): the network returned its input,
+        // residual mean 0.00024 against an input of 0.45, and nothing on screen changed with the
+        // effect, the Model or the pass count. Model B and C were at a quarter and a half of the
+        // effect. The runtime's own default, 1/32, is what goes here; LoadSettings refuses
+        // anything near zero.
+        At<float>(r, rt::B->kScale) = outScale;
+        At<int>(r, rt::B->kTonemap) = RuntimeTonemap();
+        At<uint8_t>(r, rt::B->kInlineMode) = RuntimeInline() ? 1 : 0;
+        At<uint8_t>(r, rt::B->kUseDepth) = haveDepth && g.depthUsable.load() ? 1 : 0;  // SetDepthUsable
+        // DepthInverted. Both runtimes boot this at 1 -- the NVIDIA DLL writes options+260 = 1 when
+        // the parameter is absent, and the AMD port's static initialiser sets it to 1. RenoDX sends
+        // 0 explicitly, measured on ETS2 where its depth was a dummy, so neither value has been
+        // shown right for a real buffer yet. Default 1, exposed under Depth so the comparison can
+        // be made.
+        At<UINT>(r, rt::B->kDepthInverted) = g.settings.depthInverted.load() != 0 ? 1u : 0u;
+        At<uint8_t>(r, rt::B->kFsrFlagsSeen) = 1;
+        // All three come from one place now, and that place is per-pass. Local Tone is written on
+        // the first pass only -- which is what the original `i == 0 ? tone : 0.0f` here did, and
+        // last session removed it as an asymmetry nobody had chosen. Somebody had: the reference
+        // fork's PassProfiles.h makes exactly that choice, in one line, deliberately.
+        At<int>(r, rt::B->kStyle) = style;
+        At<float>(r, rt::B->kLocalTone) = tune.tone;
+        At<float>(r, rt::B->kLocalStructure) = tune.structure;
+        At<float>(r, rt::B->kSkinStructure) = tune.skin;
+        // Quality, on a build that has it: the add-on's own setting wins over dlssnr_on_amd.ini's.
+        if (rt::B->kQuality != 0)
+            At<uint8_t>(r, rt::B->kQuality) = g.settings.quality.load() != 0 ? 1 : 0;
+
+        Packet packet {};
+        packet.list = cmd;
+        packet.colour = g.netColour.Get();
+        packet.colourState = 4;
+        packet.motion = g.netMotion.Get();
+        packet.motionState = 4;
+        packet.depth = g.netDepth.Get();
+        packet.depthState = 4;
+        packet.exposure = nullptr;
+        packet.exposureState = 4;
+        packet.scaleX = 1.0f;
+        packet.scaleY = 1.0f;
+        packet.preExposure = 1.0f;
+        // v0.4.0 also records its inline wait on this list as draws (its ini SpinDraw, default 1),
+        // so after the call the list's graphics root signature, pipeline, viewport, scissor and
+        // render targets are the runtime's. Nothing here draws, and every dispatch below binds its
+        // own compute state again, so nothing depends on them.
+        // Read before the call so the report below can say whether this pass moved anything.
+        // The list marker cannot answer that on its own: pass 1 sets it to cmd, so on pass 2
+        // the equality test below is comparing cmd against cmd whatever the engine did, and a
+        // silently refused pass 2 would be counted as accepted. The job id is the field that
+        // changes per evaluation, so an id that does not move is a pass that did not run.
+        const UINT jobBefore = At<UINT>(r, rt::B->kJobId);
+        reinterpret_cast<RecordFn>(reinterpret_cast<uintptr_t>(r) + rt::B->kRecordFn)(&packet);
+        const UINT jobAfter = At<UINT>(r, rt::B->kJobId);
+
+        if (At<uint8_t>(r, rt::B->kNativeFailure) != 0)
+        {
+            nativeFailure = true;
+            g.status.failed = true;
+            Log("pass %u reported a native failure. Stopping.", i + 1);
+            break;
+        }
+        if (At<ID3D12CommandList *>(r, rt::B->kListMarker) != cmd)
+        {
+            if (i == 0)
+                ++g.refusedRun;
+            if (++g_stats.now.refused % 600 == 1)
+                Log("pass %u refused (%llu total): %s", i + 1,
+                    static_cast<unsigned long long>(g_stats.now.refused), RefusalReason(r));
+            break;
+        }
+        // Same frame was asked and the engine could not: it latched async (no zero-copy or flag PSO).
+        if (RuntimeInline() && At<uint8_t>(r, rt::B->kInlineActive) != 1)
+        {
+            g.status.unavailable = true;
+            g.status.reason = kNotSameFrame;
+            Log("pass %u: engine latched async (no zero-copy or flag PSO); standing down", i + 1);
+            break;
+        }
+        g.lastJob = jobAfter;
+        g.recordedMask |= 1u << (r == g.runtime ? 0 : slot);
+        // The watchdog's GPU abort flag is the runtime's to reset. kWatchdogJobA/B are job ids, not
+        // a pointer to it: written through, they crashed the next recording (framecheck, frame 28).
+        ++accepted;
+        if (handed)
+            SmoothOutput(cmd, slot);
+        KeepHistory(cmd, slot);
+
+        // Reported, not enforced. Whether the engine bumps the job id once per recording or once
+        // per submission is not established, so acting on this would risk breaking out of the
+        // loop on a pass that was in fact fine -- which is exactly the failure being fixed. It
+        // prints instead, and the log then says plainly whether a second pass is real work.
+        if (wanted > 1 && !g.loggedPassDetail)
+            Log("pass %u of %u: job id %u -> %u (%s), list marker %s", i + 1, wanted, jobBefore,
+                jobAfter, jobAfter != jobBefore ? "moved, the engine recorded something"
+                                               : "DID NOT MOVE -- this pass may be a no-op",
+                At<ID3D12CommandList *>(r, rt::B->kListMarker) == cmd ? "ours" : "not ours");
+
+        // Serial submission orders both the image dependency and the CPU tuning.
+        // The legacy batch path below only orders resource accesses on the GPU.
+        if (i + 1 < wanted)
+        {
+            if (g.settings.serialPasses.load())
+            {
+                // The worker reads tuning from module globals when it runs, not
+                // when RecordFn records a job. Finish this pass before the next
+                // one overwrites them. A UAV barrier only orders GPU accesses.
+                if (!submitPass || !submitPass())
+                {
+                    g.status.failed = true;
+                    Log("could not finish pass %u before changing its parameters", i + 1);
+                    return false;
+                }
+            }
+            else
+            {
+                D3D12_RESOURCE_BARRIER between {};
+                between.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                between.UAV.pResource = g.netColour.Get();
+                cmd->ResourceBarrier(1, &between);
+            }
+        }
+    }
+    g.activePasses = accepted;
+    g.historyValid.fetch_and((1u << accepted) - 1);  // a pass that sat this frame out has none
+    if (accepted != 0)
+        g.refusedRun = 0;
+    // The same table the instrumented NVIDIA fork prints, in the same columns, so the two logs can
+    // be put side by side and read off. Once per arrangement: it reprints when the count or any
+    // resolved value changes and stays quiet otherwise.
+    if (runNetwork)
+    {
+        char table[512];
+        int n = std::snprintf(table, sizeof(table),
+                              "resolved tuning per pass (%u asked, %u accepted)\n"
+                              "  pass   structure  tone       skin", wanted, accepted);
+        for (UINT i = 0; i < wanted && n > 0 && n < static_cast<int>(sizeof(table)); ++i)
+        {
+            const PassTune t = TuningFor(i);
+            n += std::snprintf(table + n, sizeof(table) - n,
+                               "\n  %-6u %-10.4f %-10.4f %-10.4f%s", i + 1,
+                               static_cast<double>(t.structure), static_cast<double>(t.tone),
+                               static_cast<double>(t.skin),
+                               g.settings.passOverride[i].load() ? "  (own profile)" : "");
+        }
+        static char lastTable[512] = {};
+        if (std::strcmp(table, lastTable) != 0)
+        {
+            std::strncpy(lastTable, table, sizeof(lastTable) - 1);
+            Log("%s", table);
+        }
+    }
+    if (wanted > 1 && !g.loggedPassDetail && !MzSelected())
+    {
+        g.loggedPassDetail = true;
+        Log("multipass parameter handoff: %s", g.settings.serialPasses.load()
+                ? "each pass completes before the next tuning is written"
+                : "legacy batch (worker may read the last pass's tuning for every pass)");
+        Log("pass count: %u asked for, %u accepted. Compare the 'measure, residual' line against "
+            "a run at 1 -- an extra pass that records but changes nothing reads as the same "
+            "residual, and an extra pass that is a no-op reads as the same residual too. The "
+            "per-pass job ids above are what tells those two apart.", wanted, accepted);
+    }
+    if (accepted != 0)
+    {
+        g.lastJobAt = GetTickCount64();
+        g.jobRunning = true;
+        ++g_stats.now.evaluated;
+        NoteTemporal(haveMotion ? motionFrom : GuideSource::None);
+    }
+    else if (!nativeFailure)
+        ++g.status.idle;
+    if (nativeFailure)
+        return false;
+
+    // The engine records into this same command list, so by here netColour already holds this
+    // frame's output on the GPU timeline: re-capture, and the correction is this frame's.
+    if (accepted != 0)
+        captureResidual();
+    }
+
+    // Retried rather than fired once at a fixed frame: at frame 240 a lot of games are still
+    // on a black boot screen, and measuring there reports a black input and a zero residual
+    // for a setup that is actually fine. Keep trying every 240 frames until the input has
+    // something in it, then stop.
+    // Once in full at frame 240 (or on request), then silently every 1800 frames for the inert
+    // watchdog, which only speaks when its verdict changes, and once more after a full one: flicker.
+    if (g.activePasses != 0 &&
+        ((!g.measured && (g.settings.measureNow.exchange(false) || (g.status.frame >= 240 && g.status.frame % 240 == 0))) ||
+         (g.measured && (g.status.frame % 1800 == 0 || FlickerPending()))))
+    {
+        const UINT rowPitch = (nw * 8 + 255) & ~255u;
+        const UINT64 size = static_cast<UINT64>(rowPitch) * nh;
+        D3D12_HEAP_PROPERTIES rb {};
+        rb.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd2 {};
+        bd2.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd2.Width = size;
+        bd2.Height = 1;
+        bd2.DepthOrArraySize = 1;
+        bd2.MipLevels = 1;
+        bd2.Format = DXGI_FORMAT_UNKNOWN;
+        bd2.SampleDesc.Count = 1;
+        bd2.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (SUCCEEDED(g.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd2,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&g.readbackBase))) &&
+            SUCCEEDED(g.device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd2,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&g.readbackNr))))
+        {
+            auto grab = [&](ID3D12Resource *src, ID3D12Resource *dst) {
+                Barrier(cmd, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                D3D12_TEXTURE_COPY_LOCATION from {}, to {};
+                from.pResource = src;
+                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                from.SubresourceIndex = 0;
+                to.pResource = dst;
+                to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                to.PlacedFootprint.Footprint = { DXGI_FORMAT_R16G16B16A16_FLOAT, nw, nh, 1, rowPitch };
+                cmd->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                Barrier(cmd, src, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            };
+            grab(g.netBase.Get(), g.readbackBase.Get());
+            grab(g.netColour.Get(), g.readbackNr.Get());
+            g.pendingMeasure = true;
+        }
+    }
+
+    Barrier(cmd, g.composed.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cmd->SetComputeRootSignature(g.root.Get());
+    cmd->SetDescriptorHeaps(1, &heap);
+    cmd->SetPipelineState(g.composePipeline.Get());
+    auto ctable = heap->GetGPUDescriptorHandleForHeapStart();
+    ctable.ptr += 8 * inc;
+    cmd->SetComputeRootDescriptorTable(0, ctable);
+    // On a frame the network sat out, the residual still holds the last one's answer: compose with
+    // no correction, because one aimed at where the picture used to be reads as a trail. Zero
+    // intensity makes every step of the composition the identity, additive or ratio alike. A debug
+    // view is exempt for the reason CompositionIsFresh gives: what it draws is a buffer.
+    const bool stale = !(runNetwork && (g.activePasses != 0 || HeldOver())) && dbg == 0 && !g.settings.networkOutput.load();
+    // mochizuki's RenoDX stage hands back a finished picture with Intensity and Colour already in it:
+    // additive at full strength, unbounded, puts exactly that on the frame. A debug view keeps its own.
+    const bool finished = MzSelected() && dbg == 0;
+    const float composeStrength = stale ? 0.0f : finished ? 1.0f : strength;
+    // v0.6.0's packing, untouched: bit 0 is the filter and everything above it is the debug view.
+    UINT cdims[12] { w, h, nw, nh, static_cast<UINT>(encMode), 0, 0,
+                     (g.settings.bicubic.load() ? 1u : 0u) | (static_cast<UINT>(dbg) << 1) |
+                         (g_preserveSourceDetail.load() ? 0x100u : 0u),
+                     0, 0, 0, 0 };
+    std::memcpy(&cdims[5], &kWhite, sizeof(float));
+    std::memcpy(&cdims[6], &composeStrength, sizeof(float));
+    const float rlimit = finished ? 0.0f : g.settings.residualLimit.load();
+    const float rfade = finished ? 0.0f : g.settings.residualFade.load();
+    std::memcpy(&cdims[8], &rlimit, sizeof(float));
+    std::memcpy(&cdims[9], &rfade, sizeof(float));
+    const float cstrength = g.settings.colourStrength.load();
+    const float guardEff = finished ? 0.0f : EffectiveGuard();
+    std::memcpy(&cdims[10], &cstrength, sizeof(float));
+    std::memcpy(&cdims[11], &guardEff, sizeof(float));
+    cmd->SetComputeRoot32BitConstants(1, 12, cdims, 0);
+    cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    Barrier(cmd, g.composed.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    if (outTarget != nullptr)
+        cmd->CopyResource(outTarget, g.composed.Get());
+    Barrier(cmd, g.composed.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // Each pass took its own copy as it finished; the invalidation is a whole-chain decision.
+    DropStaleHistory(runNetwork);
+    return true;
+}
+
+#include "../transport/Transports.inc"
+
+// No lock and no work: this runs twice per frame on the render thread, and all it does is mark
+// the window in which a render-target bind belongs to ReShade rather than to the game. The
+// runtime pointer is taken in OnInitEffects (lifecycle.inc), where the lock is already held.
+void OnBeginEffects(effect_runtime *, command_list *, resource_view, resource_view)
+{
+    g.inEffects.store(true);
+}
+
+void OnFinishEffects(effect_runtime *, command_list *, resource_view, resource_view)
+{
+    g.inEffects.store(false);
+}
+
+void OnPresent(command_queue *queue, swapchain *sc, const rect *, const rect *, uint32_t,
+               const rect *)
+{
+    const Profile &profile = ProfileForThisProcess();
+    std::lock_guard guard(g.lock);
+    // First, before anything shared: every other swapchain's present leaves as the game drew it.
+    device *dev = sc != nullptr ? sc->get_device() : nullptr;
+    FrameTransport *transport = PrimaryRoute(dev, queue, sc);
+    if (transport == nullptr)
+        return;
+    // Which buffer is the scene depth is decided here, once a present, on a whole frame's worth
+    // of binds and clears. On D3D11 the equivalent is SettleGuide, a few lines into the bridge.
+    d3d12route::SettleD3D12Depth();
+    // Opt-in diagnostic controls, only on the foreground game's swapchain.
+    // No per-frame file polling and no UI interaction needed for matched captures.
+    if (g.settings.diagnostics & 1)
+    {
+        static bool reloadDown = false, captureDown = false;
+        const bool foreground = sc != nullptr && sc->get_hwnd() == GetForegroundWindow();
+        const bool ctrl = foreground && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool reload = ctrl && (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+        const bool capture = ctrl && (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
+        if (reload && !reloadDown) { LoadSettings(); Log("Ctrl+Home: diagnostic settings reloaded"); }
+        if (capture && !captureDown)
+        {
+            g.settings.capturePair = true; g.measured = false; g.measureTries = 0;
+            g.settings.measureNow.store(true);
+            Log("Ctrl+PageDown: matched input/runtime capture requested");
+        }
+        reloadDown = reload; captureDown = capture;
+    }
+    if (ToggleRequested())
+    {
+        const bool on = !g.settings.enabled.load();
+        g.settings.enabled.store(on);
+        Log("%s: %s", HotkeyName().c_str(), on ? "on" : "off");
+    }
+    if (!g.settings.enabled.load() || g.status.unavailable || g.status.failed || DeviceLost())
+    {
+        g.status.windowHidden = true;  // off (hotkey, panel, alt-tab) is a pause too: see below
+        return;
+    }
+    if (!g.loggedProfile)
+    {
+        g.loggedProfile = true;
+        Log("target: %s", profile.note);
+        Log("tier %c, scale %.2f", 'A' + static_cast<int>(profile.tier),
+            static_cast<double>(profile.scale));
+    }
+
+    // Alt-tab, and the whole class of bugs behind it.
+    //
+    // Nothing this add-on produces is visible while the game's window is minimised, and every
+    // expensive thing it does behaves badly there. Windows deprioritises a background process's
+    // GPU work, so our cross-device copies, our fence waits and -- worst of all -- the engine's
+    // own *inline* CPU spin all run long. That spin is on the game's render thread, with a fixed
+    // iteration cap sized for a foreground frame, and it is what "Styx freezes randomly when I
+    // alt-tab to desktop" looks like from inside the process.
+    //
+    // Standing down here costs a frame nobody is looking at, and it covers every route.
+    if (auto *hwnd = static_cast<HWND>(sc->get_hwnd()); hwnd != nullptr)
+    {
+        // Alt-tab, when the user asked for it to switch the effect off. A real switch-off, not a
+        // pause: the next frame leaves through the `!enabled` return further up and stays there
+        // until the hotkey is pressed. Losing focus is the broader condition and fires first, so
+        // this also covers exclusive fullscreen, which minimises on the way out.
+        if (g.settings.disableOnAltTab.load() && GetForegroundWindow() != hwnd)
+        {
+            g.settings.enabled.store(false);
+            g.status.windowHidden = true;  // so switched back on, it starts clean: see below
+            Log("alt-tab: effect switched off, because Disable On Alt-Tab is on. It stays off; "
+                "press %s in the game to bring it back.", HotkeyName().c_str());
+            return;
+        }
+
+        // Minimised, unconditionally and whatever the switch above is set to. This one resumes
+        // on its own, because it is a safety rather than a preference: there is no decision for
+        // a user to make about frames nobody can see.
+        if (IsIconic(hwnd))
+        {
+            if (!g.status.loggedHidden)
+            {
+                g.status.loggedHidden = true;
+                Log("the window is minimised, so the add-on is sitting the frame out. It picks "
+                    "back up on restore. This is not an error, and it is only logged once.");
+            }
+            g.status.windowHidden = true;
+            return;
+        }
+    }
+    if (g.status.windowHidden)
+    {
+        g.status.windowHidden = false;
+        // Back from minimised or off, the last network output is however many seconds old while
+        // the motion handed with it is one frame's: a temporal denoiser smears the stale frame
+        // across the new one, the ghosting people see for a second or two after alt-tabbing back.
+        ResetTemporal("the effect resumed (window restored, or switched back on)");
+        // And the job latch, or the next present times the whole pause as one long network job.
+        g.jobRunning = false;
+    }
+
+    transport->Present(dev, queue, sc);
+}
+
+#include "panel64.inc"
+
+}
+
+// The host and this add-on use ReShade's shared ImGui API on the render thread.
+extern "C" __declspec(dllexport) void UnishadeNR_DrawPanel(reshade::api::effect_runtime* runtime)
+{
+    if (runtime) OnOverlay(runtime);
+}
+
+extern "C" __declspec(dllexport) void UnishadeNR_SetPreserveDetail(int enabled)
+{
+    const bool on = enabled != 0;
+    if (g_preserveSourceDetail.exchange(on) != on)
+        Log("UnishadeNR: source detail preservation %s; reduced-raster neural correction is transferred onto the captured frame", on ? "ON" : "OFF");
+}
+
+extern "C" __declspec(dllexport) const char *NAME = "OpenNR - UnishadeNR";
+extern "C" __declspec(dllexport) const char *DESCRIPTION =
+    "Runs DLSS-NR on AMD with HIP 7. D3D11/D3D12"
+#if AMDNR_WITH_VULKAN
+    ", experimental Vulkan"
+#endif
+#if AMDNR_WITH_OPENGL
+    ", experimental OpenGL"
+#endif
+    ". Local experimental build: up to five serial neural passes; not an official release.";
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
+{
+    switch (reason)
+    {
+    case DLL_PROCESS_ATTACH:
+        // This local experiment is only intended for the external host, never for injection into Roblox.
+        {
+            wchar_t processPath[32768]{};
+            GetModuleFileNameW(nullptr, processPath, static_cast<DWORD>(std::size(processPath)));
+            const wchar_t* leaf = std::wcsrchr(processPath, L'\\');
+            const wchar_t* name = leaf ? leaf + 1 : processPath;
+            if (_wcsicmp(name, L"Unishade.exe") != 0 && _wcsicmp(name, L"UnishadeNR.exe") != 0)
+                return FALSE;
+            g_preserveSourceDetail.store(_wcsicmp(name, L"UnishadeNR.exe") == 0);
+        }
+        if (!reshade::register_addon(module))
+            return FALSE;
+        {
+            OpenLog();
+            Log("OpenNR: %s", ProfileForThisProcess().note);
+            Log("preview 2026-09-10: SDR input contract, serialized inline passes; Vulkan %d, "
+                "OpenGL %d", AMDNR_WITH_VULKAN, AMDNR_WITH_OPENGL);
+            // Before the read, so a first run has a documented file to read and the user has
+            // something to edit without being told which keys exist. On the run that writes it,
+            // it has already read the settings for the reason its own comment gives, and a second
+            // read here would only re-parse what it just wrote.
+            g_factory = ReadPanelSettings();  // the table's defaults, as g is constructed
+            if (!EnsureNeuralIni())
+                LoadSettings();
+        }
+        // Kept even though it has never fired on D3D12: measured, PCSX2 on D3D12 delivers zero
+        // depth-stencil binds in 600 frames, with or without also subscribing to the draw events.
+        // The probe tells you why -- on D3D12 ReShade shows an add-on only the two swapchain
+        // targets, while the same probe on D3D11 sees eight, depth included. See README,
+        // "What the network can actually be fed".
+        if (g.events & 1)
+            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+                OnBindDepthStencil);
+        if (g.events & 2)
+        {
+            reshade::register_event<reshade::addon_event::draw>(OnDraw);
+            reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+            reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawIndirect);
+        }
+        if (g.events & 4)
+            reshade::register_event<reshade::addon_event::clear_depth_stencil_view>(OnClearDepth);
+        reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+        // Every device: nothing is done until d3d10_1.dll is in and the hook is there to undo.
+        reshade::register_event<reshade::addon_event::init_device>([](device *) {
+            if (const char *unhooked = d3d10unhook::RestoreCompileShader())
+                Log("%s.", unhooked);
+        });
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+        reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffects);
+        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffects);
+        reshade::register_event<reshade::addon_event::reshade_begin_effects>(OnBeginEffects);
+        reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnFinishEffects);
+        reshade::register_event<reshade::addon_event::present>(OnPresent);
+        if (g.events & 16)
+            reshade::register_overlay("OpenNR", OnOverlay);
+        Log("events subscribed: mask %d (destroy_swapchain and destroy_device always on)",
+            g.events);
+        for (FrameTransport *transport : AllTransports())
+            transport->OnAddonLoad();
+        break;
+    case DLL_PROCESS_DETACH:
+        // reserved is non-null when the process is exiting rather than unloading us.
+        for (FrameTransport *transport : AllTransports())
+            transport->OnAddonUnload(reserved != nullptr);
+        stallwatch::Watch::Get().Stop(reserved != nullptr);
+        if (g_probe != nullptr)
+            RemoveVectoredExceptionHandler(g_probe);
+        if (g.events & 16)
+            reshade::unregister_overlay("OpenNR", OnOverlay);
+        reshade::unregister_addon(module);
+        if (g_log != nullptr)
+            fclose(g_log), g_log = nullptr;
+        break;
+    }
+    return TRUE;
+}

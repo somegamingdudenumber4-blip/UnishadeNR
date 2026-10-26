@@ -1,0 +1,12 @@
+* text=auto
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+OpenNR-Multipass-source/3rdparty/** -text
+*.png binary
+*.jpg binary
+*.ico binary
